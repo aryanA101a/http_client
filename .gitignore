@@ -1,0 +1,8 @@
+# Build artifacts
+/http_client
+*.o
+*.d
+.depend
+
+# Local system files
+.DS_Store
