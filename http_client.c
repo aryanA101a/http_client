@@ -17,6 +17,18 @@ typedef struct url
     char path[4096];
 } url_t;
 
+typedef struct sink
+{
+    int (*write)(struct sink *s, const void *data, size_t len);
+} sink_t;
+
+typedef struct
+{
+    sink_t *sink;
+    const char *url;
+    void (*on_progress)(size_t received, size_t total);
+} http_req_t;
+
 void parse_url(char *url, url_t *result)
 {
     int pn = 0;
@@ -83,7 +95,7 @@ void print_line(char *buf, size_t n)
     }
 }
 
-int http_get(char *url)
+int http_get(http_req_t req)
 {
     url_t p_url;
     struct addrinfo *dns_res, *dns_res0;
@@ -91,16 +103,16 @@ int http_get(char *url)
     char res_buf[256];
     char *line = NULL;
     int n = 0;
-    int rn = 0;
+    size_t rn = 0;
     size_t hn = 0;
     int l_cap = 0;
     int e;
-    int c_len = -1;
+    size_t c_len = -1;
     int chunked = 0;
     FILE *sfp = NULL;
     FILE *dfile = NULL;
 
-    parse_url(url, &p_url);
+    parse_url(req.url, &p_url);
 
     char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
     dfile = fopen(filename, "wb");
@@ -227,9 +239,10 @@ int http_get(char *url)
 
     if (c_len >= 0)
     {
-        while (c_len)
+        size_t total = c_len;
+        while (total)
         {
-            size_t want = c_len < sizeof(res_buf) ? c_len : sizeof(res_buf);
+            size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
             rn = fread(res_buf, 1, want, sfp);
             if (rn == 0)
             {
@@ -237,11 +250,13 @@ int http_get(char *url)
                 goto cleanup;
             }
             fwrite(res_buf, 1, rn, dfile);
-            c_len -= rn;
+            total -= rn;
+            req.on_progress(c_len - total, c_len);
         }
     }
     else if (chunked)
     {
+        size_t down_n = 0;
         while (1)
         {
             size_t ch_len = -1;
@@ -265,20 +280,25 @@ int http_get(char *url)
                 break;
             }
 
-            printf("bytes: %d\n", val);
+            // printf("bytes: %d\n", val);
 
             if ((rn = fread(res_buf, 1, val, sfp)) > 0)
             {
                 fwrite(res_buf, 1, rn, dfile);
                 fread(res_buf, 1, 2, sfp);
+                down_n += rn;
+                req.on_progress(down_n, 0);
             }
         }
     }
     else
     {
+        size_t down_n = 0;
         while ((rn = fread(res_buf, 1, sizeof(res_buf), sfp)) > 0)
         {
             fwrite(res_buf, 1, rn, dfile);
+            down_n += rn;
+            req.on_progress(down_n, 0);
         }
     }
 
@@ -293,7 +313,19 @@ cleanup:
     return 0;
 }
 
+void on_progress(size_t received, size_t total)
+{
+    if (total)
+        printf("\r%zu/%zu", received, total);
+    else
+        printf("\r%zu", received);
+    fflush(stdout);
+}
+
 int main()
 {
-    http_get("http://httpbingo.org/image/jpeg");
+    http_req_t req = {.url = "http://download.freebsd.org/snapshots/arm64/14.4-STABLE/kernel.txz",
+                      .on_progress = on_progress,
+                      .sink = NULL};
+    http_get(req);
 }
