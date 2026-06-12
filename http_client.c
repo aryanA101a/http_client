@@ -13,11 +13,15 @@
 #include <errno.h>
 #include <time.h>
 
+#define PROTO_LENGTH 6
+#define HOST_LENGTH 254
+#define PATH_LENGTH 4096
+
 typedef struct url
 {
-    char protocol[6];
-    char hostname[254];
-    char path[4096];
+    char protocol[PROTO_LENGTH];
+    char hostname[HOST_LENGTH];
+    char path[PATH_LENGTH];
 } url_t;
 
 typedef struct sink
@@ -32,10 +36,14 @@ typedef struct
     void (*on_progress)(size_t received, size_t total);
 } http_req_t;
 
-void parse_url(char *url, url_t *result)
+int parse_url(char *url, url_t *result)
 {
+    if (url == NULL || result == NULL || url[0] == '\0')
+        return -1;
     int pn = 0;
     int prn = 0;
+    char *f1;
+    char *f2;
     strcpy(result->protocol, "https");
     strcpy(result->hostname, "");
     strcpy(result->path, "/");
@@ -43,39 +51,51 @@ void parse_url(char *url, url_t *result)
     char *sep1 = "://";
     char sep2 = '/';
 
-    int start = 0;
-    int sep1_cur = 0;
-    for (int cur = 0; cur <= strlen(url); cur++)
+    f1 = strstr(url, sep1);
+    if (f1)
     {
-        if (sep1_cur == strlen(sep1) - 1)
-        {
-
-            prn = snprintf(result->protocol, cur - 1, "%.*s\n", cur - 1, url);
-            start = cur + 1;
-            sep1_cur = -1;
-            continue;
-        }
-        if (url[cur] == sep1[sep1_cur])
-        {
-            sep1_cur++;
-            continue;
-        }
-
-        if (url[cur] == sep2 && !(url[cur - 1] == ':' || url[cur - 1] == '/'))
-        {
-            pn = snprintf(result->path, strlen(url) - cur + 1, "%.*s\n", strlen(url) - cur + 1, url + cur);
-            snprintf(result->hostname, strlen(url) - prn - pn + 1, "%.*s\n", strlen(url) - prn - pn + 1, url + prn + 1);
-            break;
-        }
-
-        if (cur == strlen(url) - 1)
-        {
-            char *s = !prn ? url + prn + 1 : url;
-            int l = !prn ? strlen(url) - prn : strlen(url);
-            snprintf(result->hostname, l, "%.*s\n", l, s);
-        }
-        start++;
+        size_t proto_len = f1 - url;
+        if (proto_len >= PROTO_LENGTH)
+            return -1;
+        strncpy(result->protocol, url, proto_len);
+        result->protocol[proto_len] = '\0';
+        f1 += strlen(sep1);
     }
+
+    char *host_start = f1 ? f1 : url;
+
+    f2 = strchr(host_start, sep2);
+    if (f2)
+    {
+        if (strlen(f2) >= PATH_LENGTH)
+            return -1;
+        strcpy(result->path, f2);
+
+        if (f1)
+        {
+
+            size_t host_len = f2 - f1;
+            if (host_len >= HOST_LENGTH)
+                return -1;
+            strncpy(result->hostname, f1, host_len);
+            result->hostname[host_len] = '\0';
+        }
+        else
+        {
+            size_t host_len = f2 - url;
+            if (host_len >= HOST_LENGTH)
+                return -1;
+            strncpy(result->hostname, url, host_len);
+            result->hostname[host_len] = '\0';
+        }
+    }
+    else
+    {
+        if (strlen(host_start) >= HOST_LENGTH)
+            return -1;
+        strcpy(result->hostname, host_start);
+    }
+    return 0;
 }
 
 void print_line(char *buf, size_t n)
@@ -207,6 +227,55 @@ int read_line(buf *buf, int fd)
     return (0);
 }
 
+int parse_status_line(char *line, int *status)
+{
+    char *version, *code, *sp;
+    int st;
+
+    if (line == NULL || status == NULL)
+        return -1;
+
+    line[strcspn(line, "\r\n")] = '\0';
+
+    version = line;
+
+    sp = strchr(line, ' ');
+    if (sp == NULL)
+        return -1;
+
+    *sp++ = '\0';
+
+    if (*sp == ' ' || *sp == '\0')
+        return -1;
+
+    code = sp;
+
+    /* Ignore reason phrase. */
+    sp = strchr(code, ' ');
+    if (sp != NULL)
+        *sp = '\0';
+
+    /* Accept HTTP/1.x only. */
+    if (strlen(version) != 8 ||
+        strncmp(version, "HTTP/1.", 7) != 0 ||
+        !isdigit((unsigned char)version[7]))
+        return -1;
+
+    if (strlen(code) != 3 ||
+        !isdigit((unsigned char)code[0]) ||
+        !isdigit((unsigned char)code[1]) ||
+        !isdigit((unsigned char)code[2]))
+        return -1;
+
+    st = (code[0] - '0') * 100 +
+         (code[1] - '0') * 10 +
+         (code[2] - '0');
+
+    *status = st;
+
+    return 0;
+}
+
 int http_get(http_req_t req)
 {
     url_t p_url;
@@ -224,7 +293,10 @@ int http_get(http_req_t req)
     int status;
     buf line = {.buffer = NULL, .capacity = 0, .size = 0};
 
-    parse_url(req.url, &p_url);
+    if (parse_url(req.url, &p_url) == -1)
+        goto cleanup;
+
+    // printf("%s %s %s\n", p_url.protocol, p_url.hostname, p_url.path);
 
     char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
     dfile = fopen(filename, "wb");
@@ -284,26 +356,20 @@ int http_get(http_req_t req)
                  p_url.path, p_url.hostname);
     write(s, req_buf, n);
 
-    // sfp = fdopen(s, "r+");
-    // if (!sfp)
-    // {
-    //     perror("fdopen");
-    //     goto cleanup;
-    // }
-
     if (read_line(&line, s) == -1)
     {
         goto cleanup;
     }
 
-    // printf("%s", line.buffer);
-    if (sscanf(line.buffer, "%15s %d", version, &status) != 2)
+    if (parse_status_line(line.buffer, &status) == -1)
     {
         puts("bad status");
         goto cleanup;
     }
 
-    printf("version:%s status:%d\n\n", version, status);
+    // printf("%s", line.buffer);
+
+    printf("status:%d\n\n", status);
 
     char *col = NULL;
     char *h_key = NULL;
@@ -476,7 +542,7 @@ int main()
 {
     // http://httpbingo.org/image/jpeg
     // http://download.freebsd.org/snapshots/arm64/14.4-STABLE/kernel.txz
-    http_req_t req = {.url = "http://download.freebsd.org/snapshots/arm64/14.4-STABLE/kernel.txz",
+    http_req_t req = {.url = "http://download.freebsd.org/releases/arm64/14.3-RELEASE/ports.txz",
                       .on_progress = on_progress,
                       .sink = NULL};
     http_get(req);
