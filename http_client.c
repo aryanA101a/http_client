@@ -17,6 +17,18 @@
 #define HOST_LENGTH 254
 #define PATH_LENGTH 4096
 
+#define URL_LENGTH (PROTO_LENGTH + 3 + HOST_LENGTH + PATH_LENGTH)
+
+#define MAX_REDIRECTS 5
+
+// should be initialized by {null,0,0} if not allocated at the initialization
+typedef struct
+{
+    char *buffer;
+    size_t capacity;
+    size_t size;
+} buf;
+
 typedef struct url
 {
     char protocol[PROTO_LENGTH];
@@ -33,15 +45,88 @@ typedef struct
 {
     sink_t *sink;
     const char *url;
+    const char *port;
     void (*on_progress)(size_t received, size_t total);
 } http_req_t;
+
+typedef struct
+{
+    ssize_t content_length;
+    int chunked;
+    int has_location;
+    char location[URL_LENGTH];
+} http_headers_t;
+
+typedef enum
+{
+    HTTP_OK = 0,
+    HTTP_ERR_USAGE = 2,
+    HTTP_ERR_URL_INVALID = 10,
+    HTTP_ERR_CONNECT = 11,
+    HTTP_ERR_IO = 12,
+    HTTP_ERR_STATUS_INVALID_LINE = 20,
+    HTTP_ERR_RESPONSE_UNSUPPORTED = 21,
+    HTTP_ERR_HEADER_MALFORMED = 30,
+    HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH = 31,
+    HTTP_ERR_HEADER_UNSUPPORTED_TRANSFER_ENCODING = 32,
+    HTTP_ERR_BODY_INVALID_CHUNK_SIZE = 40,
+    HTTP_ERR_BODY_TRUNCATED = 41,
+    HTTP_ERR_RESPONSE_SERVER_ERROR = 50,
+    HTTP_ERR_RESPONSE_CLIENT_ERROR = 51
+} http_error_t;
+
+const char *http_error_name(http_error_t err)
+{
+    switch (err)
+    {
+    case HTTP_OK:
+        return "ok";
+    case HTTP_ERR_USAGE:
+        return "usage";
+    case HTTP_ERR_URL_INVALID:
+        return "url.invalid";
+    case HTTP_ERR_CONNECT:
+        return "connect";
+    case HTTP_ERR_IO:
+        return "io";
+    case HTTP_ERR_STATUS_INVALID_LINE:
+        return "status.invalid_line";
+    case HTTP_ERR_RESPONSE_UNSUPPORTED:
+        return "response.unsupported";
+    case HTTP_ERR_HEADER_MALFORMED:
+        return "header.malformed";
+    case HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH:
+        return "header.invalid_content_length";
+    case HTTP_ERR_HEADER_UNSUPPORTED_TRANSFER_ENCODING:
+        return "header.unsupported_transfer_encoding";
+    case HTTP_ERR_BODY_INVALID_CHUNK_SIZE:
+        return "body.invalid_chunk_size";
+    case HTTP_ERR_BODY_TRUNCATED:
+        return "body.truncated";
+    case HTTP_ERR_RESPONSE_SERVER_ERROR:
+        return "server.error";
+    case HTTP_ERR_RESPONSE_CLIENT_ERROR:
+        return "client.error";
+    }
+
+    return "unknown";
+}
+
+int http_fail(http_error_t err, const char *detail)
+{
+    fprintf(stderr, "http_client: %s", http_error_name(err));
+    if (detail != NULL && detail[0] != '\0')
+        fprintf(stderr, ": %s", detail);
+    fputc('\n', stderr);
+
+    return (int)err;
+}
 
 int parse_url(char *url, url_t *result)
 {
     if (url == NULL || result == NULL || url[0] == '\0')
         return -1;
-    int pn = 0;
-    int prn = 0;
+
     char *f1;
     char *f2;
     strcpy(result->protocol, "https");
@@ -100,7 +185,7 @@ int parse_url(char *url, url_t *result)
 
 void print_line(char *buf, size_t n)
 {
-    for (ssize_t i = 0; i < n; i++)
+    for (size_t i = 0; i < n; i++)
     {
         unsigned char c = buf[i];
 
@@ -147,7 +232,7 @@ ssize_t read_exact(int fd, void *buf, size_t n)
         {
             if (now_ms() - start_ms > 10000)
             {
-                puts("idle timeout");
+                errno = ETIMEDOUT;
                 return -1;
             }
             continue;
@@ -161,7 +246,9 @@ ssize_t read_exact(int fd, void *buf, size_t n)
 
             return rn;
         }
-        if (pfd.revents & (POLLERR | POLLNVAL | POLLHUP))
+        if (pfd.revents & POLLHUP)
+            return 0;
+        if (pfd.revents & (POLLERR | POLLNVAL))
         {
             errno = EIO;
             return -1;
@@ -169,18 +256,10 @@ ssize_t read_exact(int fd, void *buf, size_t n)
     }
 }
 
-// should be initialized by {null,0,0} if not allocated at the initialization
-typedef struct
-{
-    char *buffer;
-    size_t capacity;
-    size_t size;
-} buf;
-
 int read_line(buf *buf, int fd)
 {
     char c;
-    size_t len;
+    ssize_t len;
     char *tmp;
     size_t tmpsize;
 
@@ -250,7 +329,6 @@ int parse_status_line(char *line, int *status)
 
     code = sp;
 
-    /* Ignore reason phrase. */
     sp = strchr(code, ' ');
     if (sp != NULL)
         *sp = '\0';
@@ -276,30 +354,11 @@ int parse_status_line(char *line, int *status)
     return 0;
 }
 
-int http_get(http_req_t req)
+int connect_url(url_t p_url, http_req_t req, int *s)
 {
-    url_t p_url;
-    struct addrinfo *dns_res, *dns_res0;
-    char req_buf[6114];
-    char res_buf[2048];
-    int n = 0;
-    ssize_t rn = 0;
-    int e;
-    ssize_t c_len = -1;
-    int chunked = 0;
-    FILE *sfp = NULL;
-    FILE *dfile = NULL;
-    char version[16];
-    int status;
-    buf line = {.buffer = NULL, .capacity = 0, .size = 0};
-
-    if (parse_url(req.url, &p_url) == -1)
-        goto cleanup;
-
-    // printf("%s %s %s\n", p_url.protocol, p_url.hostname, p_url.path);
-
-    char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
-    dfile = fopen(filename, "wb");
+    const char *service;
+    struct addrinfo *dns_res, *dns_res0 = NULL;
+    *s = -1;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -308,166 +367,211 @@ int http_get(http_req_t req)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    e = getaddrinfo(p_url.hostname, p_url.protocol, &hints, &dns_res0);
-    if (e != 0)
+    service = req.port != NULL ? req.port : p_url.protocol;
+
+    int e;
+    if ((e = getaddrinfo(p_url.hostname, service, &hints, &dns_res0)) != 0)
     {
-        printf("%s\n", gai_strerror(e));
-        goto cleanup;
+        return http_fail(HTTP_ERR_CONNECT, gai_strerror(e));
     }
 
-    int s = -1;
     for (dns_res = dns_res0; dns_res; dns_res = dns_res->ai_next)
     {
 
-        s = socket(dns_res->ai_family,
-                   dns_res->ai_socktype,
-                   dns_res->ai_protocol);
+        *s = socket(dns_res->ai_family,
+                    dns_res->ai_socktype,
+                    dns_res->ai_protocol);
 
-        if (s < 0)
+        if (*s < 0)
         {
-            perror("socket");
             continue;
         }
 
-        if (connect(s, dns_res->ai_addr, dns_res->ai_addrlen) < 0)
+        if (connect(*s, dns_res->ai_addr, dns_res->ai_addrlen) < 0)
         {
-            perror("connect");
-            close(s);
-            s = -1;
+            close(*s);
+            *s = -1;
             continue;
         }
 
-        printf("connected!\n\n");
         break;
     }
 
-    if (s < 0)
-    {
-        err(1, "%s", "cannot connect");
-        goto cleanup;
-    }
     freeaddrinfo(dns_res0);
 
-    n = snprintf(req_buf, sizeof(req_buf), "GET %s HTTP/1.1\r\n"
-                                           "Host: %s\r\n"
-                                           "User-Agent: aryan-http-client/0.1\r\n"
-                                           "Accept: */*\r\n"
-                                           "\r\n",
-                 p_url.path, p_url.hostname);
-    write(s, req_buf, n);
+    if (*s < 0)
+        return http_fail(HTTP_ERR_CONNECT, "cannot connect");
 
-    if (read_line(&line, s) == -1)
+    return HTTP_OK;
+}
+
+int read_status(int s, int *status, buf *line)
+{
+    while (1)
     {
-        goto cleanup;
+        if (read_line(line, s) == -1)
+        {
+            return http_fail(HTTP_ERR_IO, "reading status line");
+        }
+
+        if (parse_status_line(line->buffer, status) == -1)
+        {
+            return http_fail(HTTP_ERR_STATUS_INVALID_LINE, NULL);
+        }
+
+        if (*status == 101)
+        {
+            return http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "101 Switching Protocols");
+        }
+
+        if (*status >= 100 && *status < 200)
+        {
+            // discard headers
+            while (1)
+            {
+                if (read_line(line, s) == -1)
+                    return http_fail(HTTP_ERR_IO, "reading interim response header");
+
+                if (strcmp(line->buffer, "\r\n") == 0 ||
+                    strcmp(line->buffer, "\n") == 0)
+                    break;
+            }
+            continue;
+        }
+
+        return HTTP_OK;
     }
+}
 
-    if (parse_status_line(line.buffer, &status) == -1)
-    {
-        puts("bad status");
-        goto cleanup;
-    }
+int read_headers(int s, buf *line, http_headers_t *headers)
+{
 
-    // printf("%s", line.buffer);
-
-    printf("status:%d\n\n", status);
+    headers->content_length = -1;
+    headers->chunked = 0;
+    headers->has_location = 0;
+    headers->location[0] = '\0';
 
     char *col = NULL;
     char *h_key = NULL;
     char *h_val = NULL;
-    do
+
+    while (1)
     {
-        if (read_line(&line, s) == -1)
+        if (read_line(line, s) == -1)
         {
-            goto cleanup;
+            return http_fail(HTTP_ERR_IO, "reading header");
         }
 
-        col = strchr(line.buffer, ':');
+        if (strcmp(line->buffer, "\r\n") == 0)
+            break;
 
-        if (col)
+        col = strchr(line->buffer, ':');
+
+        if (col == NULL)
         {
-            *col = '\0';
-
-            h_key = line.buffer;
-            h_val = col + 1;
-
-            while (*h_val == ' ' || *h_val == '\t')
-                h_val++;
-
-            h_val[strcspn(h_val, "\r\n")] = '\0';
-
-            printf("key:%s value:%s\n", h_key, h_val);
-
-            if (strcasecmp(h_key, "Content-Length") == 0)
-            {
-                char *end;
-                long val;
-                val = strtol(h_val, &end, 10);
-                if (end == h_val)
-                {
-                    puts("invalid value");
-                }
-                c_len = val;
-            }
-            if (strcasecmp(h_key, "Transfer-Encoding") == 0 && strcasecmp(h_val, "Chunked") == 0)
-            {
-                chunked = 1;
-            }
+            return http_fail(HTTP_ERR_HEADER_MALFORMED, line->buffer);
         }
 
-    } while (strcmp(line.buffer, "\r\n") != 0);
+        *col = '\0';
 
-    printf("\n");
-    if (c_len >= 0)
+        h_key = line->buffer;
+        h_val = col + 1;
+
+        while (*h_val == ' ' || *h_val == '\t')
+            h_val++;
+
+        h_val[strcspn(h_val, "\r\n")] = '\0';
+
+        printf("key:%s value:%s\n", h_key, h_val);
+
+        if (strcasecmp(h_key, "Content-Length") == 0)
+        {
+            char *end;
+            long val;
+            errno = 0;
+            val = strtol(h_val, &end, 10);
+            if (end == h_val || *end != '\0' || errno == ERANGE || val < 0)
+            {
+                return http_fail(HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH, h_val);
+            }
+            headers->content_length = val;
+        }
+        if (strcasecmp(h_key, "Transfer-Encoding") == 0)
+        {
+            if (strcasecmp(h_val, "Chunked") == 0)
+            {
+                headers->chunked = 1;
+                continue;
+            }
+            return http_fail(HTTP_ERR_HEADER_UNSUPPORTED_TRANSFER_ENCODING,
+                             h_val);
+        }
+        if (strcasecmp(h_key, "Location") == 0)
+        {
+            headers->has_location = 1;
+            if (strlen(h_val) + 1 > URL_LENGTH)
+            {
+                return http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "unsupported location size");
+            }
+            strcpy(headers->location, h_val);
+        }
+    };
+    return HTTP_OK;
+}
+
+int read_body(int s, FILE *dfile, buf *line,
+              const http_headers_t *headers, const http_req_t *req)
+{
+    ssize_t rn = 0;
+    char res_buf[2048];
+
+    if (headers->content_length >= 0)
     {
         puts("content_length");
-        size_t total = c_len;
+        size_t total = headers->content_length;
         while (total)
         {
             size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
             rn = read_exact(s, res_buf, want);
             if (rn == 0)
             {
-                puts("response truncated");
-                goto cleanup;
+                return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             }
             if (rn < 0)
             {
-                perror("read");
-                goto cleanup;
+                return http_fail(HTTP_ERR_IO, "reading body");
             }
 
             fwrite(res_buf, 1, rn, dfile);
             total -= rn;
-            req.on_progress(c_len - total, c_len);
+            if (req->on_progress)
+                req->on_progress(headers->content_length - total, headers->content_length);
         }
     }
-    else if (chunked)
+    else if (headers->chunked)
     {
         puts("chunked");
 
         size_t down_n = 0;
         while (1)
         {
-            size_t ch_len = -1;
-            if (read_line(&line, s) == -1)
+            if (read_line(line, s) == -1)
             {
-                puts("request truncated");
-                goto cleanup;
+                return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             };
 
             char *end;
             errno = 0;
-            unsigned long long val = strtoull(line.buffer, &end, 16);
+            unsigned long long val = strtoull(line->buffer, &end, 16);
 
-            if (end == line.buffer || errno == ERANGE)
+            if (end == line->buffer || errno == ERANGE)
             {
-                puts("invalid chunk size");
-                goto cleanup;
+                return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, line->buffer);
             }
 
             if (val == 0)
             {
-                read_line(&line, s);
+                read_line(line, s);
                 break;
             }
 
@@ -480,30 +584,27 @@ int http_get(http_req_t req)
                 rn = read_exact(s, res_buf, want);
                 if (rn == 0)
                 {
-                    puts("response truncated");
-                    goto cleanup;
+                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 }
                 if (rn < 0)
                 {
-                    perror("read");
-                    goto cleanup;
+                    return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
                 fwrite(res_buf, 1, rn, dfile);
                 down_n += rn;
                 total -= rn;
-                req.on_progress(down_n, 0);
+                if (req->on_progress)
+                    req->on_progress(down_n, 0);
             }
 
             rn = read_exact(s, res_buf, 2);
             if (rn == 0)
             {
-                puts("response truncated");
-                goto cleanup;
+                return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             }
             if (rn < 0)
             {
-                perror("read");
-                goto cleanup;
+                return http_fail(HTTP_ERR_IO, "reading chunk terminator");
             }
         }
     }
@@ -514,19 +615,191 @@ int http_get(http_req_t req)
         {
             fwrite(res_buf, 1, rn, dfile);
             down_n += rn;
-            req.on_progress(down_n, 0);
+            if (req->on_progress)
+                req->on_progress(down_n, 0);
         }
+
+        if (rn < 0)
+            return http_fail(HTTP_ERR_IO, "reading body");
     }
+    return HTTP_OK;
+}
+
+int http_get(http_req_t req)
+{
+    int result;
+    int no_body;
+    int s;
+
+    char req_buf[6114];
+    buf line = {.buffer = NULL, .capacity = 0, .size = 0};
+
+    FILE *dfile = NULL;
+    http_headers_t headers;
+
+    char c_url[URL_LENGTH];
+    if (snprintf(c_url, sizeof(c_url), "%s", req.url) >= sizeof(c_url))
+        return http_fail(HTTP_ERR_URL_INVALID, req.url);
+
+    url_t p_url;
+
+    int redirects = 0;
+    int redirect = 0;
+
+    do
+    {
+        redirect = 0;
+
+        s = -1;
+        ssize_t n = 0;
+        no_body = 0;
+        int status;
+        result = HTTP_OK;
+        p_url = (url_t){0};
+        char authority[HOST_LENGTH + 7];
+
+        if (parse_url(c_url, &p_url) == -1)
+        {
+            result = http_fail(HTTP_ERR_URL_INVALID, req.url);
+            goto cleanup;
+        }
+
+        result = connect_url(p_url, req, &s);
+        if (result != HTTP_OK)
+            goto cleanup;
+
+        if (req.port != NULL)
+            snprintf(authority, sizeof(authority), "%s:%s", p_url.hostname,
+                     req.port);
+        else
+            snprintf(authority, sizeof(authority), "%s", p_url.hostname);
+
+        n = snprintf(req_buf, sizeof(req_buf), "GET %s HTTP/1.1\r\n"
+                                               "Host: %s\r\n"
+                                               "User-Agent: aryan-http-client/0.1\r\n"
+                                               "Accept: */*\r\n"
+                                               "\r\n",
+                     p_url.path, authority);
+        write(s, req_buf, n);
+
+        result = read_status(s, &status, &line);
+        if (result != HTTP_OK)
+            goto cleanup;
+
+        // printf("%s", line.buffer);
+
+        printf("status:%d\n\n", status);
+
+        switch (status)
+        {
+        case 200:
+            break;
+
+        case 204:
+            no_body = 1;
+            break;
+
+        case 301:
+        case 302:
+        case 303:
+        case 307:
+        case 308:
+            redirect = 1;
+            break;
+
+        case 206:
+            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED,
+                               "206 Partial Content without Range support");
+            goto cleanup;
+
+        case 401:
+            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED,
+                               "401 Authorization Required");
+            goto cleanup;
+
+        case 407:
+            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED,
+                               "407 Proxy Authentication Required");
+            goto cleanup;
+
+        default:
+            if (status >= 500 && status <= 599)
+            {
+                result = http_fail(HTTP_ERR_RESPONSE_SERVER_ERROR, line.buffer);
+                goto cleanup;
+            }
+
+            if (status >= 400 && status <= 499)
+            {
+                result = http_fail(HTTP_ERR_RESPONSE_CLIENT_ERROR, line.buffer);
+                goto cleanup;
+            }
+
+            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, line.buffer);
+            goto cleanup;
+        }
+
+        // read headers
+
+        result = read_headers(s, &line, &headers);
+        if (result != HTTP_OK)
+            goto cleanup;
+
+        if (redirect)
+        {
+            if (!headers.has_location)
+            {
+                result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "redirect without Location");
+                goto cleanup;
+            }
+
+            if (headers.location[0] == '/')
+                snprintf(c_url, sizeof(c_url), "%s://%s%s",
+                         p_url.protocol, p_url.hostname, headers.location);
+            else
+                snprintf(c_url, sizeof(c_url), "%s", headers.location);
+
+            close(s);
+            s = -1;
+        }
+    } while (redirect && ++redirects <= MAX_REDIRECTS);
+
+    if (redirect)
+    {
+        result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "too many redirects");
+        goto cleanup;
+    }
+
+    if (no_body)
+    {
+        goto cleanup;
+    }
+
+    char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
+    dfile = fopen(filename, "wb");
+    if (dfile == NULL)
+    {
+        result = http_fail(HTTP_ERR_IO, filename);
+        goto cleanup;
+    }
+
+    printf("\n");
+    // read body
+    result = read_body(s, dfile, &line, &headers, &req);
+    if (result != HTTP_OK)
+        goto cleanup;
 
     fflush(dfile);
 
 cleanup:
     if (line.buffer)
         free(line.buffer);
+    if (s >= 0)
+        close(s);
     if (dfile)
         fclose(dfile);
 
-    return 0;
+    return result;
 }
 
 void on_progress(size_t received, size_t total)
@@ -538,12 +811,24 @@ void on_progress(size_t received, size_t total)
     fflush(stdout);
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    // http://httpbingo.org/image/jpeg
-    // http://download.freebsd.org/snapshots/arm64/14.4-STABLE/kernel.txz
-    http_req_t req = {.url = "http://download.freebsd.org/releases/arm64/14.3-RELEASE/ports.txz",
+    const char *port = NULL;
+    const char *url = NULL;
+
+    if (argc == 2)
+        url = argv[1];
+    else if (argc == 4 && strcmp(argv[1], "-p") == 0)
+    {
+        port = argv[2];
+        url = argv[3];
+    }
+    else
+        return http_fail(HTTP_ERR_USAGE, "usage: http_client [-p port] URL");
+
+    http_req_t req = {.url = url,
+                      .port = port,
                       .on_progress = on_progress,
                       .sink = NULL};
-    http_get(req);
+    return http_get(req);
 }
