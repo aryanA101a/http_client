@@ -88,6 +88,8 @@ def assert_basic_get_request(request, path, port):
     assert f"Host: 127.0.0.1:{port}\r\n" in text
     assert "User-Agent: aryan-http-client/0.1\r\n" in text
     assert "Accept: */*\r\n" in text
+    assert "Accept-Encoding: identity\r\n" in text
+    assert "Connection: close\r\n" in text
 
 
 def test_http_get_with_content_length(http_client_bin, tmp_path):
@@ -109,6 +111,44 @@ def test_http_get_with_content_length(http_client_bin, tmp_path):
     assert proc.stderr == ""
     assert_basic_get_request(server.requests[0], "/get", server.port)
     assert (tmp_path / "get").read_bytes() == b"-foo-\n"
+
+
+def test_identity_content_encoding_is_accepted(http_client_bin, tmp_path):
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Encoding: identity\r\n"
+        b"Content-Length: 6\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"-foo-\n"
+    )
+
+    with ScriptedHTTPServer([response]) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/identity")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert_basic_get_request(server.requests[0], "/identity", server.port)
+    assert (tmp_path / "identity").read_bytes() == b"-foo-\n"
+
+
+def test_unsupported_content_encoding_is_rejected(http_client_bin, tmp_path):
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Encoding: gzip\r\n"
+        b"Content-Length: 6\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"-foo-\n"
+    )
+
+    with ScriptedHTTPServer([response]) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/gzip")
+
+    assert proc.returncode == 21
+    assert "http_client: response.unsupported: unsupported Content-Encoding" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/gzip", server.port)
+    assert not (tmp_path / "gzip").exists()
 
 
 def test_chunked_response(http_client_bin, tmp_path):
@@ -392,6 +432,25 @@ def test_malformed_header_line_is_observable(http_client_bin, tmp_path):
     assert_basic_get_request(server.requests[0], "/bad-header", server.port)
 
 
+def test_truncated_content_length_body_is_observable(http_client_bin, tmp_path):
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 6\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"abc"
+    )
+
+    with ScriptedHTTPServer([response]) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/short-body")
+
+    # Local diagnostic seed: Content-Length promises more bytes than the server
+    # sends, so an exact body read must be classified as a truncated body.
+    assert proc.returncode != 0
+    assert "http_client: body.truncated" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/short-body", server.port)
+
+
 @pytest.mark.xfail(strict=True, reason="maximum response header line length is not enforced yet")
 def test_too_long_response_header_is_rejected(http_client_bin, tmp_path):
     response = (
@@ -480,7 +539,6 @@ def test_chunked_takes_precedence_over_content_length(http_client_bin, tmp_path)
     assert (tmp_path / "te-wins").read_bytes() == b"chunked data fun"
 
 
-@pytest.mark.xfail(strict=True, reason="premature chunked EOF is not classified as truncated yet")
 def test_premature_chunked_close_is_truncated(http_client_bin, tmp_path):
     response = (
         b"HTTP/1.1 200 funky chunky!\r\n"

@@ -212,7 +212,7 @@ int64_t now_ms(void)
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-ssize_t read_exact(int fd, void *buf, size_t n)
+ssize_t read_with_timeout(int fd, void *buf, size_t n)
 {
     int64_t start_ms = now_ms();
 
@@ -254,6 +254,28 @@ ssize_t read_exact(int fd, void *buf, size_t n)
             return -1;
         }
     }
+}
+
+ssize_t
+read_exact(int fd, void *buf, size_t n)
+{
+    char *p = buf;
+    size_t off = 0;
+    while (off < n)
+    {
+        ssize_t rn = read_with_timeout(fd, p + off, n - off);
+        if (rn < 0)
+            return -1;
+
+        if (rn == 0)
+        {
+            errno = ECONNRESET;
+            return -1;
+        }
+
+        off += rn;
+    }
+    return (ssize_t)off;
 }
 
 int read_line(buf *buf, int fd)
@@ -386,8 +408,14 @@ int connect_url(url_t p_url, http_req_t req, int *s)
         {
             continue;
         }
-
-        if (connect(*s, dns_res->ai_addr, dns_res->ai_addrlen) < 0)
+        int e;
+        while ((e = connect(*s, dns_res->ai_addr, dns_res->ai_addrlen)) < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (e < 0)
         {
             close(*s);
             *s = -1;
@@ -484,6 +512,12 @@ int read_headers(int s, buf *line, http_headers_t *headers)
 
         printf("key:%s value:%s\n", h_key, h_val);
 
+        if (strcasecmp(h_key, "Content-Encoding") == 0 &&
+            strcasecmp(h_val, "identity") != 0)
+        {
+            return http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "unsupported Content-Encoding");
+        }
+
         if (strcasecmp(h_key, "Content-Length") == 0)
         {
             char *end;
@@ -533,12 +567,10 @@ int read_body(int s, FILE *dfile, buf *line,
         {
             size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
             rn = read_exact(s, res_buf, want);
-            if (rn == 0)
-            {
-                return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
-            }
             if (rn < 0)
             {
+                if (errno == ECONNRESET)
+                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 return http_fail(HTTP_ERR_IO, "reading body");
             }
 
@@ -571,7 +603,8 @@ int read_body(int s, FILE *dfile, buf *line,
 
             if (val == 0)
             {
-                read_line(line, s);
+                if (read_line(line, s) == -1)
+                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 break;
             }
 
@@ -582,12 +615,10 @@ int read_body(int s, FILE *dfile, buf *line,
             {
                 size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
                 rn = read_exact(s, res_buf, want);
-                if (rn == 0)
-                {
-                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
-                }
                 if (rn < 0)
                 {
+                    if (errno == ECONNRESET)
+                        return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                     return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
                 fwrite(res_buf, 1, rn, dfile);
@@ -598,12 +629,10 @@ int read_body(int s, FILE *dfile, buf *line,
             }
 
             rn = read_exact(s, res_buf, 2);
-            if (rn == 0)
-            {
-                return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
-            }
             if (rn < 0)
             {
+                if (errno == ECONNRESET)
+                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 return http_fail(HTTP_ERR_IO, "reading chunk terminator");
             }
         }
@@ -611,7 +640,7 @@ int read_body(int s, FILE *dfile, buf *line,
     else
     {
         size_t down_n = 0;
-        while ((rn = read_exact(s, res_buf, sizeof(res_buf))) > 0)
+        while ((rn = read_with_timeout(s, res_buf, sizeof(res_buf))) > 0)
         {
             fwrite(res_buf, 1, rn, dfile);
             down_n += rn;
@@ -678,9 +707,36 @@ int http_get(http_req_t req)
                                                "Host: %s\r\n"
                                                "User-Agent: aryan-http-client/0.1\r\n"
                                                "Accept: */*\r\n"
+                                               "Accept-Encoding: identity\r\n"
+                                               "Connection: close\r\n"
                                                "\r\n",
                      p_url.path, authority);
-        write(s, req_buf, n);
+
+        size_t off = 0;
+        size_t len = (size_t)n;
+
+        do
+        {
+            ssize_t wn = write(s, req_buf + off, len - off);
+
+            if (wn < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+
+                result = http_fail(HTTP_ERR_IO, "sending request");
+                goto cleanup;
+            }
+
+            if (wn == 0)
+            {
+                result = http_fail(HTTP_ERR_IO, "socket write returned zero");
+                goto cleanup;
+            }
+
+            off += wn;
+
+        } while (off < len);
 
         result = read_status(s, &status, &line);
         if (result != HTTP_OK)
