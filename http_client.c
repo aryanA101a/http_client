@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <err.h>
 #include <errno.h>
@@ -15,11 +16,13 @@
 
 #define PROTO_LENGTH 6
 #define HOST_LENGTH 254
+#define PORT_LENGTH 6
 #define PATH_LENGTH 4096
 
-#define URL_LENGTH (PROTO_LENGTH + 3 + HOST_LENGTH + PATH_LENGTH)
+#define URL_LENGTH (PROTO_LENGTH + 3 + HOST_LENGTH + 1 + PORT_LENGTH + PATH_LENGTH)
 
 #define MAX_REDIRECTS 5
+#define MAX_INFO_RESPONSES 10
 
 // should be initialized by {null,0,0} if not allocated at the initialization
 typedef struct
@@ -33,6 +36,7 @@ typedef struct url
 {
     char protocol[PROTO_LENGTH];
     char hostname[HOST_LENGTH];
+    char port[PORT_LENGTH];
     char path[PATH_LENGTH];
 } url_t;
 
@@ -45,7 +49,6 @@ typedef struct
 {
     sink_t *sink;
     const char *url;
-    const char *port;
     void (*on_progress)(size_t received, size_t total);
 } http_req_t;
 
@@ -64,6 +67,7 @@ typedef enum
     HTTP_ERR_URL_INVALID = 10,
     HTTP_ERR_CONNECT = 11,
     HTTP_ERR_IO = 12,
+    HTTP_ERR_REQUEST_TOO_LARGE = 13,
     HTTP_ERR_STATUS_INVALID_LINE = 20,
     HTTP_ERR_RESPONSE_UNSUPPORTED = 21,
     HTTP_ERR_HEADER_MALFORMED = 30,
@@ -89,6 +93,8 @@ const char *http_error_name(http_error_t err)
         return "connect";
     case HTTP_ERR_IO:
         return "io";
+    case HTTP_ERR_REQUEST_TOO_LARGE:
+        return "request.too_large";
     case HTTP_ERR_STATUS_INVALID_LINE:
         return "status.invalid_line";
     case HTTP_ERR_RESPONSE_UNSUPPORTED:
@@ -131,6 +137,7 @@ int parse_url(char *url, url_t *result)
     char *f2;
     strcpy(result->protocol, "https");
     strcpy(result->hostname, "");
+    strcpy(result->port, "");
     strcpy(result->path, "/");
 
     char *sep1 = "://";
@@ -140,7 +147,7 @@ int parse_url(char *url, url_t *result)
     if (f1)
     {
         size_t proto_len = f1 - url;
-        if (proto_len >= PROTO_LENGTH)
+        if (proto_len == 0 || proto_len >= PROTO_LENGTH)
             return -1;
         strncpy(result->protocol, url, proto_len);
         result->protocol[proto_len] = '\0';
@@ -155,51 +162,31 @@ int parse_url(char *url, url_t *result)
         if (strlen(f2) >= PATH_LENGTH)
             return -1;
         strcpy(result->path, f2);
-
-        if (f1)
-        {
-
-            size_t host_len = f2 - f1;
-            if (host_len >= HOST_LENGTH)
-                return -1;
-            strncpy(result->hostname, f1, host_len);
-            result->hostname[host_len] = '\0';
-        }
-        else
-        {
-            size_t host_len = f2 - url;
-            if (host_len >= HOST_LENGTH)
-                return -1;
-            strncpy(result->hostname, url, host_len);
-            result->hostname[host_len] = '\0';
-        }
     }
-    else
+
+    char *host_end = f2 ? f2 : host_start + strlen(host_start);
+    char *port_start = memchr(host_start, ':', host_end - host_start);
+    char *hostname_end = port_start ? port_start : host_end;
+    size_t host_len = hostname_end - host_start;
+    if (host_len == 0 || host_len >= HOST_LENGTH)
+        return -1;
+
+    strncpy(result->hostname, host_start, host_len);
+    result->hostname[host_len] = '\0';
+
+    if (port_start != NULL)
     {
-        if (strlen(host_start) >= HOST_LENGTH)
+        port_start++;
+        size_t port_len = host_end - port_start;
+        if (port_len == 0 || port_len >= PORT_LENGTH)
             return -1;
-        strcpy(result->hostname, host_start);
+        for (size_t i = 0; i < port_len; i++)
+            if (!isdigit((unsigned char)port_start[i]))
+                return -1;
+        strncpy(result->port, port_start, port_len);
+        result->port[port_len] = '\0';
     }
     return 0;
-}
-
-void print_line(char *buf, size_t n)
-{
-    for (size_t i = 0; i < n; i++)
-    {
-        unsigned char c = buf[i];
-
-        if (c == '\r')
-            printf("\\r");
-        else if (c == '\n')
-            printf("\\n\n");
-        else if (c == '\t')
-            printf("\\t");
-        else if (isprint(c))
-            putchar(c);
-        else
-            printf("\\x%02x", c);
-    }
 }
 
 int64_t now_ms(void)
@@ -215,13 +202,29 @@ int64_t now_ms(void)
 ssize_t read_with_timeout(int fd, void *buf, size_t n)
 {
     int64_t start_ms = now_ms();
+    if (start_ms < 0)
+        return -1;
+    int64_t deadline_ms = start_ms + 10000;
 
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     int ret;
 
     while (1)
     {
-        ret = poll(&pfd, 1, 250);
+        int64_t cur_ms = now_ms();
+        if (cur_ms < 0)
+            return -1;
+        if (cur_ms >= deadline_ms)
+        {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        int64_t remaining_ms = deadline_ms - cur_ms;
+        int timeout_ms = remaining_ms < 250 ? (int)remaining_ms : 250;
+
+        pfd.revents = 0;
+        ret = poll(&pfd, 1, timeout_ms);
         if (ret < 0)
         {
             if (errno == EINTR)
@@ -230,11 +233,6 @@ ssize_t read_with_timeout(int fd, void *buf, size_t n)
         }
         if (ret == 0)
         {
-            if (now_ms() - start_ms > 10000)
-            {
-                errno = ETIMEDOUT;
-                return -1;
-            }
             continue;
         }
 
@@ -278,6 +276,33 @@ read_exact(int fd, void *buf, size_t n)
     return (ssize_t)off;
 }
 
+int write_exact(int fd, const void *buf, size_t n)
+{
+    const char *p = buf;
+    size_t off = 0;
+    size_t len = (size_t)n;
+    do
+    {
+        ssize_t wn = write(fd, p + off, len - off);
+
+        if (wn < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (wn == 0)
+        {
+            errno = EIO;
+            return -1;
+        }
+
+        off += wn;
+
+    } while (off < len);
+    return 0;
+}
+
 int read_line(buf *buf, int fd)
 {
     char c;
@@ -303,8 +328,6 @@ int read_line(buf *buf, int fd)
         len = read_exact(fd, &c, 1);
         if (len == -1)
             return (-1);
-        if (len == 0)
-            break;
 
         buf->buffer[buf->size++] = c;
 
@@ -376,7 +399,7 @@ int parse_status_line(char *line, int *status)
     return 0;
 }
 
-int connect_url(url_t p_url, http_req_t req, int *s)
+int connect_url(url_t p_url, int *s)
 {
     const char *service;
     struct addrinfo *dns_res, *dns_res0 = NULL;
@@ -389,7 +412,7 @@ int connect_url(url_t p_url, http_req_t req, int *s)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    service = req.port != NULL ? req.port : p_url.protocol;
+    service = p_url.port[0] != '\0' ? p_url.port : p_url.protocol;
 
     int e;
     if ((e = getaddrinfo(p_url.hostname, service, &hints, &dns_res0)) != 0)
@@ -435,6 +458,8 @@ int connect_url(url_t p_url, http_req_t req, int *s)
 
 int read_status(int s, int *status, buf *line)
 {
+    int info_responses = 0;
+
     while (1)
     {
         if (read_line(line, s) == -1)
@@ -454,6 +479,9 @@ int read_status(int s, int *status, buf *line)
 
         if (*status >= 100 && *status < 200)
         {
+            if (++info_responses > MAX_INFO_RESPONSES)
+                return http_fail(HTTP_ERR_IO, "max info headers reached");
+
             // discard headers
             while (1)
             {
@@ -510,7 +538,7 @@ int read_headers(int s, buf *line, http_headers_t *headers)
 
         h_val[strcspn(h_val, "\r\n")] = '\0';
 
-        printf("key:%s value:%s\n", h_key, h_val);
+        // printf("key:%s value:%s\n", h_key, h_val);
 
         if (strcasecmp(h_key, "Content-Encoding") == 0 &&
             strcasecmp(h_val, "identity") != 0)
@@ -524,7 +552,7 @@ int read_headers(int s, buf *line, http_headers_t *headers)
             long val;
             errno = 0;
             val = strtol(h_val, &end, 10);
-            if (end == h_val || *end != '\0' || errno == ERANGE || val < 0)
+            if (end == h_val || *end != '\0' || errno == ERANGE || val < 0 || (headers->content_length >= 0 && val != headers->content_length))
             {
                 return http_fail(HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH, h_val);
             }
@@ -553,37 +581,14 @@ int read_headers(int s, buf *line, http_headers_t *headers)
     return HTTP_OK;
 }
 
-int read_body(int s, FILE *dfile, buf *line,
+int read_body(int s, int dfile, buf *line,
               const http_headers_t *headers, const http_req_t *req)
 {
     ssize_t rn = 0;
     char res_buf[2048];
 
-    if (headers->content_length >= 0)
+    if (headers->chunked)
     {
-        puts("content_length");
-        size_t total = headers->content_length;
-        while (total)
-        {
-            size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
-            rn = read_exact(s, res_buf, want);
-            if (rn < 0)
-            {
-                if (errno == ECONNRESET)
-                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
-                return http_fail(HTTP_ERR_IO, "reading body");
-            }
-
-            fwrite(res_buf, 1, rn, dfile);
-            total -= rn;
-            if (req->on_progress)
-                req->on_progress(headers->content_length - total, headers->content_length);
-        }
-    }
-    else if (headers->chunked)
-    {
-        puts("chunked");
-
         size_t down_n = 0;
         while (1)
         {
@@ -592,16 +597,34 @@ int read_body(int s, FILE *dfile, buf *line,
                 return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             };
 
-            char *end;
-            errno = 0;
-            unsigned long long val = strtoull(line->buffer, &end, 16);
+            size_t chunk_size=0;
+            char *p;
 
-            if (end == line->buffer || errno == ERANGE)
+            if (line->size < 2 || !isxdigit((unsigned char)*line->buffer))
+                return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, NULL);
+
+            for (p = line->buffer; *p && !isspace((unsigned char)*p); ++p)
             {
-                return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, line->buffer);
+                int digit;
+
+                if (*p == ';')
+                    break;
+                if (!isxdigit((unsigned char)*p))
+                    return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, NULL);
+                if (isdigit((unsigned char)*p))
+                {
+                    digit = *p - '0';
+                }
+                else
+                {
+                    digit = 10 + tolower((unsigned char)*p) - 'a';
+                }
+                if (chunk_size > (SIZE_MAX - (size_t)digit) / 16)
+                    return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, NULL);
+                chunk_size = chunk_size * 16 + (size_t)digit;
             }
 
-            if (val == 0)
+            if (chunk_size == 0)
             {
                 if (read_line(line, s) == -1)
                     return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
@@ -610,7 +633,7 @@ int read_body(int s, FILE *dfile, buf *line,
 
             // printf("bytes: %d\n", val);
 
-            size_t total = val;
+            size_t total = chunk_size;
             while (total)
             {
                 size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
@@ -621,7 +644,10 @@ int read_body(int s, FILE *dfile, buf *line,
                         return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                     return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
-                fwrite(res_buf, 1, rn, dfile);
+
+                if (write_exact(dfile, res_buf, rn) == -1)
+                    return http_fail(HTTP_ERR_IO, "writing file");
+
                 down_n += rn;
                 total -= rn;
                 if (req->on_progress)
@@ -635,6 +661,29 @@ int read_body(int s, FILE *dfile, buf *line,
                     return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 return http_fail(HTTP_ERR_IO, "reading chunk terminator");
             }
+            if (res_buf[0] != '\r' || res_buf[1] != '\n')
+                return http_fail(HTTP_ERR_BODY_INVALID_CHUNK_SIZE, NULL);
+        }
+    }
+    else if (headers->content_length >= 0)
+    {
+        size_t total = headers->content_length;
+        while (total)
+        {
+            size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
+            rn = read_exact(s, res_buf, want);
+            if (rn < 0)
+            {
+                if (errno == ECONNRESET)
+                    return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
+                return http_fail(HTTP_ERR_IO, "reading body");
+            }
+
+            if (write_exact(dfile, res_buf, rn) == -1)
+                return http_fail(HTTP_ERR_IO, "writing file");
+            total -= rn;
+            if (req->on_progress)
+                req->on_progress(headers->content_length - total, headers->content_length);
         }
     }
     else
@@ -642,7 +691,8 @@ int read_body(int s, FILE *dfile, buf *line,
         size_t down_n = 0;
         while ((rn = read_with_timeout(s, res_buf, sizeof(res_buf))) > 0)
         {
-            fwrite(res_buf, 1, rn, dfile);
+            if (write_exact(dfile, res_buf, rn) == -1)
+                return http_fail(HTTP_ERR_IO, "writing file");
             down_n += rn;
             if (req->on_progress)
                 req->on_progress(down_n, 0);
@@ -663,11 +713,12 @@ int http_get(http_req_t req)
     char req_buf[6114];
     buf line = {.buffer = NULL, .capacity = 0, .size = 0};
 
-    FILE *dfile = NULL;
+    int dfile = -1;
     http_headers_t headers;
 
     char c_url[URL_LENGTH];
-    if (snprintf(c_url, sizeof(c_url), "%s", req.url) >= sizeof(c_url))
+    int url_n = snprintf(c_url, sizeof(c_url), "%s", req.url);
+    if (url_n < 0 || (size_t)url_n >= sizeof(c_url))
         return http_fail(HTTP_ERR_URL_INVALID, req.url);
 
     url_t p_url;
@@ -693,15 +744,20 @@ int http_get(http_req_t req)
             goto cleanup;
         }
 
-        result = connect_url(p_url, req, &s);
+        result = connect_url(p_url, &s);
         if (result != HTTP_OK)
             goto cleanup;
 
-        if (req.port != NULL)
-            snprintf(authority, sizeof(authority), "%s:%s", p_url.hostname,
-                     req.port);
+        if (p_url.port[0] != '\0')
+            n = snprintf(authority, sizeof(authority), "%s:%s",
+                         p_url.hostname, p_url.port);
         else
-            snprintf(authority, sizeof(authority), "%s", p_url.hostname);
+            n = snprintf(authority, sizeof(authority), "%s", p_url.hostname);
+        if (n < 0 || (size_t)n >= sizeof(authority))
+        {
+            result = http_fail(HTTP_ERR_URL_INVALID, req.url);
+            goto cleanup;
+        }
 
         n = snprintf(req_buf, sizeof(req_buf), "GET %s HTTP/1.1\r\n"
                                                "Host: %s\r\n"
@@ -711,32 +767,17 @@ int http_get(http_req_t req)
                                                "Connection: close\r\n"
                                                "\r\n",
                      p_url.path, authority);
-
-        size_t off = 0;
-        size_t len = (size_t)n;
-
-        do
+        if (n < 0 || (size_t)n >= sizeof(req_buf))
         {
-            ssize_t wn = write(s, req_buf + off, len - off);
+            result = http_fail(HTTP_ERR_REQUEST_TOO_LARGE, NULL);
+            goto cleanup;
+        }
 
-            if (wn < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-
-                result = http_fail(HTTP_ERR_IO, "sending request");
-                goto cleanup;
-            }
-
-            if (wn == 0)
-            {
-                result = http_fail(HTTP_ERR_IO, "socket write returned zero");
-                goto cleanup;
-            }
-
-            off += wn;
-
-        } while (off < len);
+        if (write_exact(s, req_buf, n) == -1)
+        {
+            result = http_fail(HTTP_ERR_IO, "sending request");
+            goto cleanup;
+        }
 
         result = read_status(s, &status, &line);
         if (result != HTTP_OK)
@@ -744,7 +785,7 @@ int http_get(http_req_t req)
 
         // printf("%s", line.buffer);
 
-        printf("status:%d\n\n", status);
+        // printf("status:%d\n\n", status);
 
         switch (status)
         {
@@ -781,17 +822,17 @@ int http_get(http_req_t req)
         default:
             if (status >= 500 && status <= 599)
             {
-                result = http_fail(HTTP_ERR_RESPONSE_SERVER_ERROR, line.buffer);
+                result = http_fail(HTTP_ERR_RESPONSE_SERVER_ERROR, NULL);
                 goto cleanup;
             }
 
             if (status >= 400 && status <= 499)
             {
-                result = http_fail(HTTP_ERR_RESPONSE_CLIENT_ERROR, line.buffer);
+                result = http_fail(HTTP_ERR_RESPONSE_CLIENT_ERROR, NULL);
                 goto cleanup;
             }
 
-            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, line.buffer);
+            result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, NULL);
             goto cleanup;
         }
 
@@ -810,10 +851,23 @@ int http_get(http_req_t req)
             }
 
             if (headers.location[0] == '/')
-                snprintf(c_url, sizeof(c_url), "%s://%s%s",
-                         p_url.protocol, p_url.hostname, headers.location);
+            {
+                if (p_url.port[0] != '\0')
+                    url_n = snprintf(c_url, sizeof(c_url), "%s://%s:%s%s",
+                                     p_url.protocol, p_url.hostname,
+                                     p_url.port, headers.location);
+                else
+                    url_n = snprintf(c_url, sizeof(c_url), "%s://%s%s",
+                                     p_url.protocol, p_url.hostname,
+                                     headers.location);
+            }
             else
-                snprintf(c_url, sizeof(c_url), "%s", headers.location);
+                url_n = snprintf(c_url, sizeof(c_url), "%s", headers.location);
+            if (url_n < 0 || (size_t)url_n >= sizeof(c_url))
+            {
+                result = http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "unsupported location size");
+                goto cleanup;
+            }
 
             close(s);
             s = -1;
@@ -832,8 +886,8 @@ int http_get(http_req_t req)
     }
 
     char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
-    dfile = fopen(filename, "wb");
-    if (dfile == NULL)
+    dfile = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (dfile == -1)
     {
         result = http_fail(HTTP_ERR_IO, filename);
         goto cleanup;
@@ -845,15 +899,13 @@ int http_get(http_req_t req)
     if (result != HTTP_OK)
         goto cleanup;
 
-    fflush(dfile);
-
 cleanup:
     if (line.buffer)
         free(line.buffer);
     if (s >= 0)
         close(s);
-    if (dfile)
-        fclose(dfile);
+    if (dfile >= 0)
+        close(dfile);
 
     return result;
 }
@@ -869,21 +921,14 @@ void on_progress(size_t received, size_t total)
 
 int main(int argc, char **argv)
 {
-    const char *port = NULL;
     const char *url = NULL;
 
     if (argc == 2)
         url = argv[1];
-    else if (argc == 4 && strcmp(argv[1], "-p") == 0)
-    {
-        port = argv[2];
-        url = argv[3];
-    }
     else
-        return http_fail(HTTP_ERR_USAGE, "usage: http_client [-p port] URL");
+        return http_fail(HTTP_ERR_USAGE, "usage: http_client URL");
 
     http_req_t req = {.url = url,
-                      .port = port,
                       .on_progress = on_progress,
                       .sink = NULL};
     return http_get(req);

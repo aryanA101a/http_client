@@ -1,3 +1,4 @@
+import os
 import socket
 import subprocess
 import threading
@@ -58,8 +59,11 @@ class ScriptedHTTPServer:
 @pytest.fixture(scope="session")
 def http_client_bin(tmp_path_factory):
     out = tmp_path_factory.mktemp("bin") / "http_client"
+    cflags = ["-Wall", "-Wextra"]
+    if os.environ.get("HTTP_CLIENT_LLDB"):
+        cflags.extend(["-g", "-O0"])
     subprocess.run(
-        ["cc", "-Wall", "-Wextra", "-o", str(out), str(SRC)],
+        ["cc", *cflags, "-o", str(out), str(SRC)],
         check=True,
         text=True,
         capture_output=True,
@@ -68,12 +72,25 @@ def http_client_bin(tmp_path_factory):
 
 
 def run_client(http_client_bin, tmp_path, server, path):
+    if os.environ.get("HTTP_CLIENT_LLDB"):
+        breakpoint_name = os.environ.get("HTTP_CLIENT_LLDB_BREAK", "main")
+        args = [
+            "lldb",
+            "--one-line",
+            f"breakpoint set --name {breakpoint_name}",
+            "--one-line",
+            "run",
+            "--",
+            str(http_client_bin),
+            f"http://127.0.0.1:{server.port}{path}",
+        ]
+        proc = subprocess.run(args, cwd=tmp_path, text=True)
+        return subprocess.CompletedProcess(args, proc.returncode, "", "")
+
     return subprocess.run(
         [
             str(http_client_bin),
-            "-p",
-            str(server.port),
-            f"http://127.0.0.1{path}",
+            f"http://127.0.0.1:{server.port}{path}",
         ],
         cwd=tmp_path,
         text=True,
@@ -270,7 +287,6 @@ def test_duplicate_matching_content_length_is_accepted(http_client_bin, tmp_path
     assert (tmp_path / "dup-cl").read_bytes() == b"-foo-\n"
 
 
-@pytest.mark.xfail(strict=True, reason="conflicting Content-Length is not rejected yet")
 def test_conflicting_content_length_is_rejected(http_client_bin, tmp_path):
     response = (
         b"HTTP/1.1 200 OK\r\n"
@@ -513,7 +529,42 @@ def test_invalid_chunk_size_is_observable(http_client_bin, tmp_path):
     assert_basic_get_request(server.requests[0], "/bad-chunk", server.port)
 
 
-@pytest.mark.xfail(strict=True, reason="chunked precedence over Content-Length is not implemented yet")
+def test_overflow_chunk_size_is_rejected(http_client_bin, tmp_path):
+    response = (
+        b"HTTP/1.1 200 funky chunky!\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        + b"f" * 128
+        + b"\r\n"
+    )
+
+    with ScriptedHTTPServer([response]) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/huge-chunk")
+
+    assert proc.returncode != 0
+    assert "http_client: body.invalid_chunk_size" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/huge-chunk", server.port)
+
+
+def test_invalid_chunk_terminator_is_rejected(http_client_bin, tmp_path):
+    response = (
+        b"HTTP/1.1 200 funky chunky!\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"4\r\n"
+        b"dataXX"
+        b"0\r\n"
+        b"\r\n"
+    )
+
+    with ScriptedHTTPServer([response]) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/bad-chunk-terminator")
+
+    assert proc.returncode != 0
+    assert "http_client: body.invalid_chunk_size" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/bad-chunk-terminator", server.port)
+
+
 def test_chunked_takes_precedence_over_content_length(http_client_bin, tmp_path):
     response = (
         b"HTTP/1.1 200 OK\r\n"
