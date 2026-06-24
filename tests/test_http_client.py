@@ -1,59 +1,14 @@
 import os
-import socket
 import subprocess
-import threading
 from pathlib import Path
 
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-class ScriptedHTTPServer:
-    def __init__(self, responses):
-        self._responses = list(responses)
-        self.requests = []
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(1)
-        self._sock.settimeout(5)
-        self.port = self._sock.getsockname()[1]
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-
-    def __enter__(self):
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self._thread.join(timeout=5)
-        self._sock.close()
-
-    def _serve(self):
-        try:
-            for response in self._responses:
-                try:
-                    conn, _ = self._sock.accept()
-                except socket.timeout:
-                    break
-                with conn:
-                    conn.settimeout(5)
-                    self.requests.append(self._read_request(conn))
-                    conn.sendall(response)
-        finally:
-            self._sock.close()
-
-    @staticmethod
-    def _read_request(conn):
-        data = bytearray()
-        while b"\r\n\r\n" not in data:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data.extend(chunk)
-        return bytes(data)
-
+from http_test_support import (
+    ScriptedHTTPServer,
+    assert_basic_get_request,
+    run_client as run_client_url,
+)
 
 @pytest.fixture(scope="session")
 def http_client_bin():
@@ -62,50 +17,20 @@ def http_client_bin():
         args.append("DBG=-g -O0")
     subprocess.run(
         args,
-        cwd=ROOT,
+        cwd=Path(__file__).resolve().parents[1],
         check=True,
         text=True,
         capture_output=True,
     )
-    return ROOT / "build" / "http_client"
+    return Path(__file__).resolve().parents[1] / "build" / "http_client"
 
 
 def run_client(http_client_bin, tmp_path, server, path):
-    if os.environ.get("HTTP_CLIENT_LLDB"):
-        breakpoint_name = os.environ.get("HTTP_CLIENT_LLDB_BREAK", "main")
-        args = [
-            "lldb",
-            "--one-line",
-            f"breakpoint set --name {breakpoint_name}",
-            "--one-line",
-            "run",
-            "--",
-            str(http_client_bin),
-            f"http://127.0.0.1:{server.port}{path}",
-        ]
-        proc = subprocess.run(args, cwd=tmp_path, text=True)
-        return subprocess.CompletedProcess(args, proc.returncode, "", "")
-
-    return subprocess.run(
-        [
-            str(http_client_bin),
-            f"http://127.0.0.1:{server.port}{path}",
-        ],
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-        timeout=5,
+    return run_client_url(
+        http_client_bin,
+        tmp_path,
+        f"http://127.0.0.1:{server.port}{path}",
     )
-
-
-def assert_basic_get_request(request, path, port):
-    text = request.decode("ascii")
-    assert text.startswith(f"GET {path} HTTP/1.1\r\n")
-    assert f"Host: 127.0.0.1:{port}\r\n" in text
-    assert "User-Agent: aryan-http-client/0.1\r\n" in text
-    assert "Accept: */*\r\n" in text
-    assert "Accept-Encoding: identity\r\n" in text
-    assert "Connection: close\r\n" in text
 
 
 def test_http_get_with_content_length(http_client_bin, tmp_path):

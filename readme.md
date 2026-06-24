@@ -16,6 +16,8 @@ bmake
 ## Tests
 
 ```sh
+python3 -m venv tests/venv
+./tests/venv/bin/python -m pip install pytest
 ./tests/venv/bin/python -m pytest tests -v
 ```
 

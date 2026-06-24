@@ -1,7 +1,8 @@
 PROG=	http_client
 MAN=
 
-.OBJDIR: ${.CURDIR}/build
+OBJDIR?=	${.CURDIR}/build
+.OBJDIR: ${OBJDIR}
 
 BEARSSL_DIR=	${.CURDIR}/BearSSL
 BEARSSL_LIB=	${BEARSSL_DIR}/build/libbearssl.a
