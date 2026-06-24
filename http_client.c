@@ -14,6 +14,9 @@
 #include <errno.h>
 #include <time.h>
 
+#include "bearssl.h"
+#include <brssl.h>
+
 #define PROTO_LENGTH 6
 #define HOST_LENGTH 254
 #define PORT_LENGTH 6
@@ -39,6 +42,28 @@ typedef struct url
     char port[PORT_LENGTH];
     char path[PATH_LENGTH];
 } url_t;
+
+typedef struct
+{
+    br_ssl_client_context client;
+    br_x509_minimal_context x509;
+    unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
+    anchor_list anchors;
+    int initialized;
+} tls_ctx;
+
+typedef struct conn conn_t;
+
+struct conn
+{
+    int fd;
+    tls_ctx tls;
+
+    ssize_t (*read)(conn_t *conn, void *buf, size_t len, int timeout_ms);
+    ssize_t (*write)(conn_t *conn, const void *buf, size_t len,
+                     int timeout_ms);
+    int (*close)(conn_t *conn);
+};
 
 typedef struct sink
 {
@@ -128,6 +153,304 @@ int http_fail(http_error_t err, const char *detail)
     return (int)err;
 }
 
+int64_t now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return -1;
+
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t
+deadline_after(int timeout_ms)
+{
+    int64_t start_ms;
+
+    if (timeout_ms < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    start_ms = now_ms();
+    if (start_ms < 0)
+        return -1;
+
+    return start_ms + timeout_ms;
+}
+
+static int
+wait_for_socket(int fd, short events, int64_t deadline)
+{
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = events};
+
+    for (;;)
+    {
+        int64_t cur_ms = now_ms();
+        if (cur_ms < 0)
+            return -1;
+        if (cur_ms >= deadline)
+        {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        int64_t remaining_ms = deadline - cur_ms;
+        int timeout_ms = remaining_ms < 250 ? (int)remaining_ms : 250;
+        int n = poll(&pfd, 1, timeout_ms);
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            continue;
+        if (pfd.revents & POLLNVAL)
+        {
+            errno = EBADF;
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP))
+            pfd.revents |= POLLIN | POLLOUT;
+
+        return pfd.revents;
+    }
+}
+
+static int
+run_brssl_engine(conn_t *conn, unsigned int target, int timeout_ms)
+{
+    br_ssl_engine_context *engine;
+    int64_t deadline;
+
+    if (conn == NULL || conn->fd < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (target != BR_SSL_SENDAPP && target != BR_SSL_RECVAPP)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    deadline = deadline_after(timeout_ms);
+    if (deadline < 0)
+        return -1;
+
+    engine = &conn->tls.client.eng;
+
+    for (;;)
+    {
+        unsigned st;
+        int sendrec, recvrec;
+        short events = 0;
+        int revents;
+
+        st = br_ssl_engine_current_state(engine);
+        if (st == BR_SSL_CLOSED)
+            return -1;
+
+        sendrec = ((st & BR_SSL_SENDREC) != 0);
+        recvrec = ((st & BR_SSL_RECVREC) != 0);
+
+        if (!sendrec)
+        {
+            if (st & target)
+                return 0;
+            if (st & BR_SSL_RECVAPP)
+            {
+                errno = EPROTO;
+                return -1;
+            }
+        }
+        if (!sendrec && !recvrec)
+        {
+            br_ssl_engine_flush(engine, 0);
+            continue;
+        }
+
+        if (sendrec)
+            events |= POLLOUT;
+        if (recvrec)
+            events |= POLLIN;
+
+        revents = wait_for_socket(conn->fd, events, deadline);
+        if (revents < 0)
+            return -1;
+
+        if (sendrec && (revents & POLLOUT))
+        {
+            unsigned char *buf;
+            size_t len;
+            ssize_t wlen;
+
+            buf = br_ssl_engine_sendrec_buf(engine, &len);
+            wlen = send(conn->fd, buf, len, 0);
+            if (wlen < 0)
+            {
+                int saved_errno = errno;
+
+                if (saved_errno == EINTR || saved_errno == EAGAIN ||
+                    saved_errno == EWOULDBLOCK)
+                    continue;
+
+                errno = saved_errno;
+                return -1;
+            }
+            if (wlen == 0)
+            {
+                errno = EPIPE;
+                return -1;
+            }
+
+            br_ssl_engine_sendrec_ack(engine, (size_t)wlen);
+            continue;
+        }
+
+        if (recvrec && (revents & POLLIN))
+        {
+            unsigned char *buf;
+            size_t len;
+            ssize_t rlen;
+
+            buf = br_ssl_engine_recvrec_buf(engine, &len);
+            rlen = recv(conn->fd, buf, len, 0);
+            if (rlen == 0)
+            {
+                errno = ECONNRESET;
+                return -1;
+            }
+            if (rlen < 0)
+            {
+                int saved_errno = errno;
+
+                if (saved_errno == EINTR || saved_errno == EAGAIN ||
+                    saved_errno == EWOULDBLOCK)
+                    continue;
+
+                errno = saved_errno;
+                return -1;
+            }
+
+            br_ssl_engine_recvrec_ack(engine, (size_t)rlen);
+            continue;
+        }
+
+        errno = EIO;
+        return -1;
+    }
+}
+
+ssize_t tcp_read(conn_t *conn, void *buf, size_t len, int timeout_ms)
+{
+    int64_t deadline = deadline_after(timeout_ms);
+    if (deadline < 0)
+        return -1;
+
+    for (;;)
+    {
+        ssize_t n = read(conn->fd, buf, len);
+
+        if (n >= 0)
+            return n;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return -1;
+        if (wait_for_socket(conn->fd, POLLIN, deadline) < 0)
+            return -1;
+    }
+}
+ssize_t tcp_write(conn_t *conn, const void *buf, size_t len, int timeout_ms)
+{
+    int64_t deadline = deadline_after(timeout_ms);
+    if (deadline < 0)
+        return -1;
+
+    for (;;)
+    {
+        ssize_t n = write(conn->fd, buf, len);
+
+        if (n >= 0)
+            return n;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return -1;
+        if (wait_for_socket(conn->fd, POLLOUT, deadline) < 0)
+            return -1;
+    }
+}
+int tcp_close(conn_t *conn)
+{
+    return close(conn->fd);
+}
+
+ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int timeout_ms)
+{
+    unsigned char *buf;
+    size_t alen;
+
+    if (len == 0)
+    {
+        return 0;
+    }
+    if (run_brssl_engine(conn, BR_SSL_RECVAPP, timeout_ms) < 0)
+    {
+        br_ssl_engine_context *engine = &conn->tls.client.eng;
+
+        if (br_ssl_engine_current_state(engine) == BR_SSL_CLOSED &&
+            br_ssl_engine_last_error(engine) == BR_ERR_OK)
+            return 0;
+
+        return -1;
+    }
+    buf = br_ssl_engine_recvapp_buf(&conn->tls.client.eng, &alen);
+    if (alen > len)
+    {
+        alen = len;
+    }
+    memcpy(dst_buf, buf, alen);
+    br_ssl_engine_recvapp_ack(&conn->tls.client.eng, alen);
+    return alen;
+}
+
+ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
+                  int timeout_ms)
+{
+    unsigned char *buf;
+    size_t alen;
+
+    if (len == 0)
+    {
+        return 0;
+    }
+    if (run_brssl_engine(conn, BR_SSL_SENDAPP, timeout_ms) < 0)
+    {
+        return -1;
+    }
+    buf = br_ssl_engine_sendapp_buf(&conn->tls.client.eng, &alen);
+    if (alen > len)
+    {
+        alen = len;
+    }
+    memcpy(buf, src_buf, alen);
+    br_ssl_engine_sendapp_ack(&conn->tls.client.eng, alen);
+    br_ssl_engine_flush(&conn->tls.client.eng, 0);
+    return alen;
+}
+int tls_close(conn_t *conn)
+{
+    VEC_CLEAREXT(conn->tls.anchors, free_ta_contents);
+    return close(conn->fd);
+}
+
 int parse_url(char *url, url_t *result)
 {
     if (url == NULL || result == NULL || url[0] == '\0')
@@ -189,79 +512,14 @@ int parse_url(char *url, url_t *result)
     return 0;
 }
 
-int64_t now_ms(void)
-{
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-        return -1;
-
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-ssize_t read_with_timeout(int fd, void *buf, size_t n)
-{
-    int64_t start_ms = now_ms();
-    if (start_ms < 0)
-        return -1;
-    int64_t deadline_ms = start_ms + 10000;
-
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    int ret;
-
-    while (1)
-    {
-        int64_t cur_ms = now_ms();
-        if (cur_ms < 0)
-            return -1;
-        if (cur_ms >= deadline_ms)
-        {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-
-        int64_t remaining_ms = deadline_ms - cur_ms;
-        int timeout_ms = remaining_ms < 250 ? (int)remaining_ms : 250;
-
-        pfd.revents = 0;
-        ret = poll(&pfd, 1, timeout_ms);
-        if (ret < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (ret == 0)
-        {
-            continue;
-        }
-
-        if (pfd.revents & POLLIN)
-        {
-            ssize_t rn = read(fd, buf, n);
-            if (rn < 0 && errno == EINTR)
-                continue;
-
-            return rn;
-        }
-        if (pfd.revents & POLLHUP)
-            return 0;
-        if (pfd.revents & (POLLERR | POLLNVAL))
-        {
-            errno = EIO;
-            return -1;
-        }
-    }
-}
-
 ssize_t
-read_exact(int fd, void *buf, size_t n)
+read_exact(conn_t *conn, void *buf, size_t n)
 {
     char *p = buf;
     size_t off = 0;
     while (off < n)
     {
-        ssize_t rn = read_with_timeout(fd, p + off, n - off);
+        ssize_t rn = conn->read(conn, p + off, n - off, 10000);
         if (rn < 0)
             return -1;
 
@@ -276,7 +534,7 @@ read_exact(int fd, void *buf, size_t n)
     return (ssize_t)off;
 }
 
-int write_exact(int fd, const void *buf, size_t n)
+int fwrite_exact(int fd, const void *buf, size_t n)
 {
     const char *p = buf;
     size_t off = 0;
@@ -303,7 +561,34 @@ int write_exact(int fd, const void *buf, size_t n)
     return 0;
 }
 
-int read_line(buf *buf, int fd)
+int write_exact(conn_t *conn, const void *buf, size_t n)
+{
+    const char *p = buf;
+    size_t off = 0;
+    size_t len = (size_t)n;
+    do
+    {
+        ssize_t wn = conn->write(conn, p + off, len - off, 10000);
+
+        if (wn < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (wn == 0)
+        {
+            errno = EIO;
+            return -1;
+        }
+
+        off += wn;
+
+    } while (off < len);
+    return 0;
+}
+
+int read_line(buf *buf, conn_t *conn)
 {
     char c;
     ssize_t len;
@@ -325,7 +610,7 @@ int read_line(buf *buf, int fd)
 
     do
     {
-        len = read_exact(fd, &c, 1);
+        len = read_exact(conn, &c, 1);
         if (len == -1)
             return (-1);
 
@@ -399,11 +684,11 @@ int parse_status_line(char *line, int *status)
     return 0;
 }
 
-int connect_url(url_t p_url, int *s)
+int connect_url(url_t p_url, conn_t *conn)
 {
     const char *service;
     struct addrinfo *dns_res, *dns_res0 = NULL;
-    *s = -1;
+    conn->fd = -1;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -423,16 +708,16 @@ int connect_url(url_t p_url, int *s)
     for (dns_res = dns_res0; dns_res; dns_res = dns_res->ai_next)
     {
 
-        *s = socket(dns_res->ai_family,
-                    dns_res->ai_socktype,
-                    dns_res->ai_protocol);
+        conn->fd = socket(dns_res->ai_family,
+                          dns_res->ai_socktype,
+                          dns_res->ai_protocol);
 
-        if (*s < 0)
+        if (conn->fd < 0)
         {
             continue;
         }
         int e;
-        while ((e = connect(*s, dns_res->ai_addr, dns_res->ai_addrlen)) < 0)
+        while ((e = connect(conn->fd, dns_res->ai_addr, dns_res->ai_addrlen)) < 0)
         {
             if (errno == EINTR)
                 continue;
@@ -440,8 +725,8 @@ int connect_url(url_t p_url, int *s)
         }
         if (e < 0)
         {
-            close(*s);
-            *s = -1;
+            close(conn->fd);
+            conn->fd = -1;
             continue;
         }
 
@@ -450,19 +735,60 @@ int connect_url(url_t p_url, int *s)
 
     freeaddrinfo(dns_res0);
 
-    if (*s < 0)
+    if (conn->fd < 0)
         return http_fail(HTTP_ERR_CONNECT, "cannot connect");
+
+    int flags = fcntl(conn->fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        close(conn->fd);
+        conn->fd = -1;
+        return http_fail(HTTP_ERR_CONNECT, "setting nonblocking mode");
+    }
+
+    if (strcasecmp(p_url.protocol, "https") == 0)
+    {
+
+        size_t tnum;
+
+        tnum = read_trust_anchors(&conn->tls.anchors, "/etc/ssl/cert.pem");
+        if (tnum == 0)
+            return http_fail(HTTP_ERR_IO, "loading trust anchors");
+
+        br_ssl_client_init_full(
+            &conn->tls.client,
+            &conn->tls.x509,
+            &VEC_ELT(conn->tls.anchors, 0),
+            VEC_LEN(conn->tls.anchors));
+        br_ssl_engine_set_buffer(&conn->tls.client.eng, &conn->tls.iobuf, sizeof conn->tls.iobuf, 1);
+
+        if (!br_ssl_client_reset(&conn->tls.client,
+                                 p_url.hostname, 0))
+        {
+            return http_fail(HTTP_ERR_CONNECT, "initializing TLS");
+        }
+
+        conn->read = tls_read;
+        conn->write = tls_write;
+        conn->close = tls_close;
+    }
+    else
+    {
+        conn->read = tcp_read;
+        conn->write = tcp_write;
+        conn->close = tcp_close;
+    }
 
     return HTTP_OK;
 }
 
-int read_status(int s, int *status, buf *line)
+int read_status(conn_t *conn, int *status, buf *line)
 {
     int info_responses = 0;
 
     while (1)
     {
-        if (read_line(line, s) == -1)
+        if (read_line(line, conn) == -1)
         {
             return http_fail(HTTP_ERR_IO, "reading status line");
         }
@@ -485,7 +811,7 @@ int read_status(int s, int *status, buf *line)
             // discard headers
             while (1)
             {
-                if (read_line(line, s) == -1)
+                if (read_line(line, conn) == -1)
                     return http_fail(HTTP_ERR_IO, "reading interim response header");
 
                 if (strcmp(line->buffer, "\r\n") == 0 ||
@@ -499,7 +825,7 @@ int read_status(int s, int *status, buf *line)
     }
 }
 
-int read_headers(int s, buf *line, http_headers_t *headers)
+int read_headers(conn_t *conn, buf *line, http_headers_t *headers)
 {
 
     headers->content_length = -1;
@@ -513,7 +839,7 @@ int read_headers(int s, buf *line, http_headers_t *headers)
 
     while (1)
     {
-        if (read_line(line, s) == -1)
+        if (read_line(line, conn) == -1)
         {
             return http_fail(HTTP_ERR_IO, "reading header");
         }
@@ -581,7 +907,7 @@ int read_headers(int s, buf *line, http_headers_t *headers)
     return HTTP_OK;
 }
 
-int read_body(int s, int dfile, buf *line,
+int read_body(conn_t *conn, int dfile, buf *line,
               const http_headers_t *headers, const http_req_t *req)
 {
     ssize_t rn = 0;
@@ -592,12 +918,12 @@ int read_body(int s, int dfile, buf *line,
         size_t down_n = 0;
         while (1)
         {
-            if (read_line(line, s) == -1)
+            if (read_line(line, conn) == -1)
             {
                 return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             };
 
-            size_t chunk_size=0;
+            size_t chunk_size = 0;
             char *p;
 
             if (line->size < 2 || !isxdigit((unsigned char)*line->buffer))
@@ -626,7 +952,7 @@ int read_body(int s, int dfile, buf *line,
 
             if (chunk_size == 0)
             {
-                if (read_line(line, s) == -1)
+                if (read_line(line, conn) == -1)
                     return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 break;
             }
@@ -637,7 +963,7 @@ int read_body(int s, int dfile, buf *line,
             while (total)
             {
                 size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
-                rn = read_exact(s, res_buf, want);
+                rn = read_exact(conn, res_buf, want);
                 if (rn < 0)
                 {
                     if (errno == ECONNRESET)
@@ -645,7 +971,7 @@ int read_body(int s, int dfile, buf *line,
                     return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
 
-                if (write_exact(dfile, res_buf, rn) == -1)
+                if (fwrite_exact(dfile, res_buf, rn) == -1)
                     return http_fail(HTTP_ERR_IO, "writing file");
 
                 down_n += rn;
@@ -654,7 +980,7 @@ int read_body(int s, int dfile, buf *line,
                     req->on_progress(down_n, 0);
             }
 
-            rn = read_exact(s, res_buf, 2);
+            rn = read_exact(conn, res_buf, 2);
             if (rn < 0)
             {
                 if (errno == ECONNRESET)
@@ -671,7 +997,7 @@ int read_body(int s, int dfile, buf *line,
         while (total)
         {
             size_t want = total < sizeof(res_buf) ? total : sizeof(res_buf);
-            rn = read_exact(s, res_buf, want);
+            rn = read_exact(conn, res_buf, want);
             if (rn < 0)
             {
                 if (errno == ECONNRESET)
@@ -679,7 +1005,7 @@ int read_body(int s, int dfile, buf *line,
                 return http_fail(HTTP_ERR_IO, "reading body");
             }
 
-            if (write_exact(dfile, res_buf, rn) == -1)
+            if (fwrite_exact(dfile, res_buf, rn) == -1)
                 return http_fail(HTTP_ERR_IO, "writing file");
             total -= rn;
             if (req->on_progress)
@@ -689,9 +1015,9 @@ int read_body(int s, int dfile, buf *line,
     else
     {
         size_t down_n = 0;
-        while ((rn = read_with_timeout(s, res_buf, sizeof(res_buf))) > 0)
+        while ((rn = conn->read(conn, res_buf, sizeof(res_buf), 10000)) > 0)
         {
-            if (write_exact(dfile, res_buf, rn) == -1)
+            if (fwrite_exact(dfile, res_buf, rn) == -1)
                 return http_fail(HTTP_ERR_IO, "writing file");
             down_n += rn;
             if (req->on_progress)
@@ -706,9 +1032,10 @@ int read_body(int s, int dfile, buf *line,
 
 int http_get(http_req_t req)
 {
+
+    conn_t conn = (conn_t){0};
     int result;
     int no_body;
-    int s;
 
     char req_buf[6114];
     buf line = {.buffer = NULL, .capacity = 0, .size = 0};
@@ -728,9 +1055,10 @@ int http_get(http_req_t req)
 
     do
     {
+
         redirect = 0;
 
-        s = -1;
+        conn.fd = -1;
         ssize_t n = 0;
         no_body = 0;
         int status;
@@ -744,7 +1072,7 @@ int http_get(http_req_t req)
             goto cleanup;
         }
 
-        result = connect_url(p_url, &s);
+        result = connect_url(p_url, &conn);
         if (result != HTTP_OK)
             goto cleanup;
 
@@ -773,13 +1101,13 @@ int http_get(http_req_t req)
             goto cleanup;
         }
 
-        if (write_exact(s, req_buf, n) == -1)
+        if (write_exact(&conn, req_buf, n) == -1)
         {
             result = http_fail(HTTP_ERR_IO, "sending request");
             goto cleanup;
         }
 
-        result = read_status(s, &status, &line);
+        result = read_status(&conn, &status, &line);
         if (result != HTTP_OK)
             goto cleanup;
 
@@ -838,7 +1166,7 @@ int http_get(http_req_t req)
 
         // read headers
 
-        result = read_headers(s, &line, &headers);
+        result = read_headers(&conn, &line, &headers);
         if (result != HTTP_OK)
             goto cleanup;
 
@@ -869,8 +1197,7 @@ int http_get(http_req_t req)
                 goto cleanup;
             }
 
-            close(s);
-            s = -1;
+            conn.close(&conn);
         }
     } while (redirect && ++redirects <= MAX_REDIRECTS);
 
@@ -895,15 +1222,15 @@ int http_get(http_req_t req)
 
     printf("\n");
     // read body
-    result = read_body(s, dfile, &line, &headers, &req);
+    result = read_body(&conn, dfile, &line, &headers, &req);
     if (result != HTTP_OK)
         goto cleanup;
 
 cleanup:
     if (line.buffer)
         free(line.buffer);
-    if (s >= 0)
-        close(s);
+    if (conn.close)
+        conn.close(&conn);
     if (dfile >= 0)
         close(dfile);
 

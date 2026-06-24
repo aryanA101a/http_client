@@ -9,7 +9,7 @@ bmake
 ## Run
 
 ```sh
-./http_client http://example.com/path
+./build/http_client http://example.com/path
 ```
 
 

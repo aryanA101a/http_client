@@ -8,7 +8,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "http_client.c"
 
 
 class ScriptedHTTPServer:
@@ -57,18 +56,18 @@ class ScriptedHTTPServer:
 
 
 @pytest.fixture(scope="session")
-def http_client_bin(tmp_path_factory):
-    out = tmp_path_factory.mktemp("bin") / "http_client"
-    cflags = ["-Wall", "-Wextra"]
+def http_client_bin():
+    args = ["bmake", "-B"]
     if os.environ.get("HTTP_CLIENT_LLDB"):
-        cflags.extend(["-g", "-O0"])
+        args.append("DBG=-g -O0")
     subprocess.run(
-        ["cc", *cflags, "-o", str(out), str(SRC)],
+        args,
+        cwd=ROOT,
         check=True,
         text=True,
         capture_output=True,
     )
-    return out
+    return ROOT / "build" / "http_client"
 
 
 def run_client(http_client_bin, tmp_path, server, path):

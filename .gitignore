@@ -3,6 +3,8 @@
 *.o
 *.d
 .depend
+/build/*
+!/build/.gitkeep
 
 # Local system files
 .DS_Store
