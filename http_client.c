@@ -15,7 +15,7 @@
 #include <time.h>
 
 #include "bearssl.h"
-#include <brssl.h>
+#include "trust_anchors.inc"
 
 #define PROTO_LENGTH 6
 #define HOST_LENGTH 254
@@ -48,8 +48,6 @@ typedef struct
     br_ssl_client_context client;
     br_x509_minimal_context x509;
     unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
-    anchor_list anchors;
-    int initialized;
 } tls_ctx;
 
 typedef struct conn conn_t;
@@ -447,7 +445,6 @@ ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
 }
 int tls_close(conn_t *conn)
 {
-    VEC_CLEAREXT(conn->tls.anchors, free_ta_contents);
     return close(conn->fd);
 }
 
@@ -748,18 +745,11 @@ int connect_url(url_t p_url, conn_t *conn)
 
     if (strcasecmp(p_url.protocol, "https") == 0)
     {
-
-        size_t tnum;
-
-        tnum = read_trust_anchors(&conn->tls.anchors, "/etc/ssl/cert.pem");
-        if (tnum == 0)
-            return http_fail(HTTP_ERR_IO, "loading trust anchors");
-
         br_ssl_client_init_full(
             &conn->tls.client,
             &conn->tls.x509,
-            &VEC_ELT(conn->tls.anchors, 0),
-            VEC_LEN(conn->tls.anchors));
+            TAs,
+            TAs_NUM);
         br_ssl_engine_set_buffer(&conn->tls.client.eng, &conn->tls.iobuf, sizeof conn->tls.iobuf, 1);
 
         if (!br_ssl_client_reset(&conn->tls.client,
