@@ -16,7 +16,7 @@ CAROOT_DIR=	${FREEBSD_SRC}/secure/caroot/trusted
 
 TRUST_ANCHORS_INC=	trust_anchors.inc
 
-SRCS=	http_client.c
+SRCS=	http_client.c main.c
 
 CFLAGS+=	-I${BEARSSL_DIR}/inc -I${.OBJDIR}
 DPADD+=		${BEARSSL_LIB}

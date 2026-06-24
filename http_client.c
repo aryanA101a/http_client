@@ -15,6 +15,7 @@
 #include <time.h>
 
 #include "bearssl.h"
+#include "http_client.h"
 #include "trust_anchors.inc"
 
 #define PROTO_LENGTH 6
@@ -63,18 +64,6 @@ struct conn
     int (*close)(conn_t *conn);
 };
 
-typedef struct sink
-{
-    int (*write)(struct sink *s, const void *data, size_t len);
-} sink_t;
-
-typedef struct
-{
-    sink_t *sink;
-    const char *url;
-    void (*on_progress)(size_t received, size_t total);
-} http_req_t;
-
 typedef struct
 {
     ssize_t content_length;
@@ -82,25 +71,6 @@ typedef struct
     int has_location;
     char location[URL_LENGTH];
 } http_headers_t;
-
-typedef enum
-{
-    HTTP_OK = 0,
-    HTTP_ERR_USAGE = 2,
-    HTTP_ERR_URL_INVALID = 10,
-    HTTP_ERR_CONNECT = 11,
-    HTTP_ERR_IO = 12,
-    HTTP_ERR_REQUEST_TOO_LARGE = 13,
-    HTTP_ERR_STATUS_INVALID_LINE = 20,
-    HTTP_ERR_RESPONSE_UNSUPPORTED = 21,
-    HTTP_ERR_HEADER_MALFORMED = 30,
-    HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH = 31,
-    HTTP_ERR_HEADER_UNSUPPORTED_TRANSFER_ENCODING = 32,
-    HTTP_ERR_BODY_INVALID_CHUNK_SIZE = 40,
-    HTTP_ERR_BODY_TRUNCATED = 41,
-    HTTP_ERR_RESPONSE_SERVER_ERROR = 50,
-    HTTP_ERR_RESPONSE_CLIENT_ERROR = 51
-} http_error_t;
 
 const char *http_error_name(http_error_t err)
 {
@@ -141,7 +111,8 @@ const char *http_error_name(http_error_t err)
     return "unknown";
 }
 
-int http_fail(http_error_t err, const char *detail)
+static int
+http_fail(http_error_t err, const char *detail)
 {
     fprintf(stderr, "http_client: %s", http_error_name(err));
     if (detail != NULL && detail[0] != '\0')
@@ -1210,7 +1181,6 @@ int http_get(http_req_t req)
         goto cleanup;
     }
 
-    printf("\n");
     // read body
     result = read_body(&conn, dfile, &line, &headers, &req);
     if (result != HTTP_OK)
@@ -1225,28 +1195,4 @@ cleanup:
         close(dfile);
 
     return result;
-}
-
-void on_progress(size_t received, size_t total)
-{
-    if (total)
-        printf("\r%zu/%zu", received, total);
-    else
-        printf("\r%zu", received);
-    fflush(stdout);
-}
-
-int main(int argc, char **argv)
-{
-    const char *url = NULL;
-
-    if (argc == 2)
-        url = argv[1];
-    else
-        return http_fail(HTTP_ERR_USAGE, "usage: http_client URL");
-
-    http_req_t req = {.url = url,
-                      .on_progress = on_progress,
-                      .sink = NULL};
-    return http_get(req);
 }
