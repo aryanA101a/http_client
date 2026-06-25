@@ -81,6 +81,80 @@ class ClosingTCPServer:
             self._sock.close()
 
 
+class StalledTCPServer:
+    def __init__(self):
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self._sock.settimeout(5)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        self._thread.join(timeout=6)
+        self._sock.close()
+
+    def _serve(self):
+        try:
+            conn, _ = self._sock.accept()
+            try:
+                with conn:
+                    self._stop.wait(timeout=20)
+            except OSError:
+                pass
+        except (OSError, socket.timeout):
+            pass
+        finally:
+            self._sock.close()
+
+
+class StalledHTTPServer:
+    def __init__(self, response_prefix=b""):
+        self._response_prefix = response_prefix
+        self._stop = threading.Event()
+        self.requests = []
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self._sock.settimeout(5)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        self._thread.join(timeout=6)
+        self._sock.close()
+
+    def _serve(self):
+        try:
+            conn, _ = self._sock.accept()
+            conn.settimeout(5)
+            try:
+                with conn:
+                    self.requests.append(read_request(conn))
+                    if self._response_prefix:
+                        conn.sendall(self._response_prefix)
+                    self._stop.wait(timeout=20)
+            except (ConnectionError, OSError):
+                pass
+        except (OSError, socket.timeout):
+            pass
+        finally:
+            self._sock.close()
+
+
 def create_tls_server_context(certfile, keyfile):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -99,7 +173,7 @@ def read_request(conn):
     return bytes(data)
 
 
-def run_client(binary, tmp_path, url):
+def run_client(binary, tmp_path, url, timeout=5):
     if os.environ.get("HTTP_CLIENT_LLDB"):
         breakpoint_name = os.environ.get("HTTP_CLIENT_LLDB_BREAK", "main")
         args = [
@@ -120,7 +194,7 @@ def run_client(binary, tmp_path, url):
         cwd=tmp_path,
         text=True,
         capture_output=True,
-        timeout=5,
+        timeout=timeout,
     )
 
 

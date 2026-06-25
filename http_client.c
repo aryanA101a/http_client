@@ -27,6 +27,7 @@
 
 #define MAX_REDIRECTS 5
 #define MAX_INFO_RESPONSES 10
+#define IO_TIMEOUT_MS 10000
 
 // should be initialized by {null,0,0} if not allocated at the initialization
 typedef struct
@@ -58,9 +59,10 @@ struct conn
     int fd;
     tls_ctx tls;
 
-    ssize_t (*read)(conn_t *conn, void *buf, size_t len, int timeout_ms);
+    ssize_t (*read)(conn_t *conn, void *buf, size_t len,
+                    int64_t deadline);
     ssize_t (*write)(conn_t *conn, const void *buf, size_t len,
-                     int timeout_ms);
+                     int64_t deadline);
     int (*close)(conn_t *conn);
 };
 
@@ -151,6 +153,29 @@ deadline_after(int timeout_ms)
 }
 
 static int
+check_deadline(int64_t deadline)
+{
+    int64_t cur_ms;
+
+    if (deadline < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    cur_ms = now_ms();
+    if (cur_ms < 0)
+        return -1;
+    if (cur_ms >= deadline)
+    {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
 wait_for_socket(int fd, short events, int64_t deadline)
 {
     struct pollfd pfd = {
@@ -193,10 +218,9 @@ wait_for_socket(int fd, short events, int64_t deadline)
 }
 
 static int
-run_brssl_engine(conn_t *conn, unsigned int target, int timeout_ms)
+run_brssl_engine(conn_t *conn, unsigned int target, int64_t deadline)
 {
     br_ssl_engine_context *engine;
-    int64_t deadline;
 
     if (conn == NULL || conn->fd < 0)
     {
@@ -208,9 +232,11 @@ run_brssl_engine(conn_t *conn, unsigned int target, int timeout_ms)
         errno = EINVAL;
         return -1;
     }
-    deadline = deadline_after(timeout_ms);
     if (deadline < 0)
+    {
+        errno = EINVAL;
         return -1;
+    }
 
     engine = &conn->tls.client.eng;
 
@@ -220,6 +246,9 @@ run_brssl_engine(conn_t *conn, unsigned int target, int timeout_ms)
         int sendrec, recvrec;
         short events = 0;
         int revents;
+
+        if (check_deadline(deadline) < 0)
+            return -1;
 
         st = br_ssl_engine_current_state(engine);
         if (st == BR_SSL_CLOSED)
@@ -316,40 +345,49 @@ run_brssl_engine(conn_t *conn, unsigned int target, int timeout_ms)
     }
 }
 
-ssize_t tcp_read(conn_t *conn, void *buf, size_t len, int timeout_ms)
+ssize_t tcp_read(conn_t *conn, void *buf, size_t len, int64_t deadline)
 {
-    int64_t deadline = deadline_after(timeout_ms);
-    if (deadline < 0)
-        return -1;
-
     for (;;)
     {
-        ssize_t n = read(conn->fd, buf, len);
+        ssize_t n;
 
+        if (check_deadline(deadline) < 0)
+            return -1;
+
+        n = read(conn->fd, buf, len);
         if (n >= 0)
             return n;
         if (errno == EINTR)
+        {
+            if (check_deadline(deadline) < 0)
+                return -1;
             continue;
+        }
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             return -1;
         if (wait_for_socket(conn->fd, POLLIN, deadline) < 0)
             return -1;
     }
 }
-ssize_t tcp_write(conn_t *conn, const void *buf, size_t len, int timeout_ms)
+ssize_t tcp_write(conn_t *conn, const void *buf, size_t len,
+                  int64_t deadline)
 {
-    int64_t deadline = deadline_after(timeout_ms);
-    if (deadline < 0)
-        return -1;
-
     for (;;)
     {
-        ssize_t n = write(conn->fd, buf, len);
+        ssize_t n;
 
+        if (check_deadline(deadline) < 0)
+            return -1;
+
+        n = write(conn->fd, buf, len);
         if (n >= 0)
             return n;
         if (errno == EINTR)
+        {
+            if (check_deadline(deadline) < 0)
+                return -1;
             continue;
+        }
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             return -1;
         if (wait_for_socket(conn->fd, POLLOUT, deadline) < 0)
@@ -361,7 +399,7 @@ int tcp_close(conn_t *conn)
     return close(conn->fd);
 }
 
-ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int timeout_ms)
+ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int64_t deadline)
 {
     unsigned char *buf;
     size_t alen;
@@ -370,7 +408,9 @@ ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int timeout_ms)
     {
         return 0;
     }
-    if (run_brssl_engine(conn, BR_SSL_RECVAPP, timeout_ms) < 0)
+    if (check_deadline(deadline) < 0)
+        return -1;
+    if (run_brssl_engine(conn, BR_SSL_RECVAPP, deadline) < 0)
     {
         br_ssl_engine_context *engine = &conn->tls.client.eng;
 
@@ -380,6 +420,8 @@ ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int timeout_ms)
 
         return -1;
     }
+    if (check_deadline(deadline) < 0)
+        return -1;
     buf = br_ssl_engine_recvapp_buf(&conn->tls.client.eng, &alen);
     if (alen > len)
     {
@@ -391,7 +433,7 @@ ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int timeout_ms)
 }
 
 ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
-                  int timeout_ms)
+                  int64_t deadline)
 {
     unsigned char *buf;
     size_t alen;
@@ -400,10 +442,14 @@ ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
     {
         return 0;
     }
-    if (run_brssl_engine(conn, BR_SSL_SENDAPP, timeout_ms) < 0)
+    if (check_deadline(deadline) < 0)
+        return -1;
+    if (run_brssl_engine(conn, BR_SSL_SENDAPP, deadline) < 0)
     {
         return -1;
     }
+    if (check_deadline(deadline) < 0)
+        return -1;
     buf = br_ssl_engine_sendapp_buf(&conn->tls.client.eng, &alen);
     if (alen > len)
     {
@@ -484,10 +530,16 @@ ssize_t
 read_exact(conn_t *conn, void *buf, size_t n)
 {
     char *p = buf;
+    int64_t deadline;
     size_t off = 0;
+
+    deadline = deadline_after(IO_TIMEOUT_MS);
+    if (deadline < 0)
+        return -1;
+
     while (off < n)
     {
-        ssize_t rn = conn->read(conn, p + off, n - off, 10000);
+        ssize_t rn = conn->read(conn, p + off, n - off, deadline);
         if (rn < 0)
             return -1;
 
@@ -532,11 +584,19 @@ int fwrite_exact(int fd, const void *buf, size_t n)
 int write_exact(conn_t *conn, const void *buf, size_t n)
 {
     const char *p = buf;
+    int64_t deadline;
     size_t off = 0;
     size_t len = (size_t)n;
-    do
+
+    deadline = deadline_after(IO_TIMEOUT_MS);
+    if (deadline < 0)
+        return -1;
+
+    while (off < len)
     {
-        ssize_t wn = conn->write(conn, p + off, len - off, 10000);
+        ssize_t wn;
+
+        wn = conn->write(conn, p + off, len - off, deadline);
 
         if (wn < 0)
         {
@@ -551,14 +611,14 @@ int write_exact(conn_t *conn, const void *buf, size_t n)
         }
 
         off += wn;
-
-    } while (off < len);
+    }
     return 0;
 }
 
 int read_line(buf *buf, conn_t *conn)
 {
     char c;
+    int64_t deadline;
     ssize_t len;
     char *tmp;
     size_t tmpsize;
@@ -575,12 +635,20 @@ int read_line(buf *buf, conn_t *conn)
 
     buf->buffer[0] = '\0';
     buf->size = 0;
+    deadline = deadline_after(IO_TIMEOUT_MS);
+    if (deadline < 0)
+        return (-1);
 
     do
     {
-        len = read_exact(conn, &c, 1);
+        len = conn->read(conn, &c, 1, deadline);
         if (len == -1)
             return (-1);
+        if (len == 0)
+        {
+            errno = ECONNRESET;
+            return (-1);
+        }
 
         buf->buffer[buf->size++] = c;
 
@@ -976,8 +1044,16 @@ int read_body(conn_t *conn, int dfile, buf *line,
     else
     {
         size_t down_n = 0;
-        while ((rn = conn->read(conn, res_buf, sizeof(res_buf), 10000)) > 0)
+        for (;;)
         {
+            int64_t deadline = deadline_after(IO_TIMEOUT_MS);
+
+            if (deadline < 0)
+                return http_fail(HTTP_ERR_IO, "reading body");
+            rn = conn->read(conn, res_buf, sizeof(res_buf), deadline);
+            if (rn <= 0)
+                break;
+
             if (fwrite_exact(dfile, res_buf, rn) == -1)
                 return http_fail(HTTP_ERR_IO, "writing file");
             down_n += rn;
@@ -1181,7 +1257,6 @@ int http_get(http_req_t req)
         goto cleanup;
     }
 
-    // read body
     result = read_body(&conn, dfile, &line, &headers, &req);
     if (result != HTTP_OK)
         goto cleanup;

@@ -7,6 +7,7 @@ import pytest
 from http_test_support import (
     ClosingTCPServer,
     ScriptedHTTPServer,
+    StalledTCPServer,
     assert_basic_get_request,
     create_tls_server_context,
     run_client,
@@ -136,6 +137,20 @@ def test_https_handshake_close_is_observable(tls_client_bin, tmp_path):
 
     assert proc.returncode != 0
     assert not (tmp_path / "closed").exists()
+
+
+def test_https_handshake_stall_times_out(tls_client_bin, tmp_path):
+    with StalledTCPServer() as server:
+        proc = run_client(
+            tls_client_bin,
+            tmp_path,
+            f"https://localhost:{server.port}/stall",
+            timeout=20,
+        )
+
+    assert proc.returncode != 0
+    assert "http_client: io: sending request" in proc.stderr
+    assert not (tmp_path / "stall").exists()
 
 
 def test_http_redirect_to_https(

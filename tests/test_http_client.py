@@ -6,6 +6,7 @@ import pytest
 
 from http_test_support import (
     ScriptedHTTPServer,
+    StalledHTTPServer,
     assert_basic_get_request,
     run_client as run_client_url,
 )
@@ -25,11 +26,12 @@ def http_client_bin():
     return Path(__file__).resolve().parents[1] / "build" / "http_client"
 
 
-def run_client(http_client_bin, tmp_path, server, path):
+def run_client(http_client_bin, tmp_path, server, path, timeout=5):
     return run_client_url(
         http_client_bin,
         tmp_path,
         f"http://127.0.0.1:{server.port}{path}",
+        timeout=timeout,
     )
 
 
@@ -534,6 +536,73 @@ def test_premature_chunked_close_is_truncated(http_client_bin, tmp_path):
     assert proc.returncode != 0
     assert "http_client: body.truncated" in proc.stderr
     assert_basic_get_request(server.requests[0], "/partial-chunk", server.port)
+
+
+def test_timeout_waiting_for_status_line_is_observable(
+    http_client_bin, tmp_path
+):
+    with StalledHTTPServer() as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/no-status", timeout=20)
+
+    assert proc.returncode != 0
+    assert "http_client: io: reading status line" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/no-status", server.port)
+    assert not (tmp_path / "no-status").exists()
+
+
+def test_timeout_waiting_for_content_length_body_is_observable(
+    http_client_bin, tmp_path
+):
+    response_prefix = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 6\r\n"
+        b"\r\n"
+        b"abc"
+    )
+
+    with StalledHTTPServer(response_prefix) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/slow-body", timeout=20)
+
+    assert proc.returncode != 0
+    assert "http_client: io: reading body" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/slow-body", server.port)
+
+
+def test_timeout_waiting_for_chunk_body_is_observable(
+    http_client_bin, tmp_path
+):
+    response_prefix = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"6\r\n"
+        b"abc"
+    )
+
+    with StalledHTTPServer(response_prefix) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/slow-chunk", timeout=20)
+
+    assert proc.returncode != 0
+    assert "http_client: io: reading chunk body" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/slow-chunk", server.port)
+
+
+def test_timeout_waiting_for_connection_close_body_is_observable(
+    http_client_bin, tmp_path
+):
+    response_prefix = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"body prefix"
+    )
+
+    with StalledHTTPServer(response_prefix) as server:
+        proc = run_client(http_client_bin, tmp_path, server, "/slow-close", timeout=20)
+
+    assert proc.returncode != 0
+    assert "http_client: io: reading body" in proc.stderr
+    assert_basic_get_request(server.requests[0], "/slow-close", server.port)
 
 
 @pytest.mark.parametrize(

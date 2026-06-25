@@ -1,5 +1,19 @@
 # http_client
 
+This is a standalone http/https client waiting to be integrated into freebsd/stand/kboot/
+
+## Clone
+
+```sh
+git clone --recurse-submodules https://github.com/aryanA101a/http_client
+```
+
+If you already cloned without submodules:
+
+```sh
+git submodule update --init
+```
+
 ## Build
 
 ```sh
