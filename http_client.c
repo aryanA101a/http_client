@@ -30,49 +30,47 @@
 #define IO_TIMEOUT_MS 10000
 
 // should be initialized by {null,0,0} if not allocated at the initialization
-typedef struct
+struct line_buffer
 {
     char *buffer;
     size_t capacity;
     size_t size;
-} buf;
+};
 
-typedef struct url
+struct url
 {
     char protocol[PROTO_LENGTH];
     char hostname[HOST_LENGTH];
     char port[PORT_LENGTH];
     char path[PATH_LENGTH];
-} url_t;
+};
 
-typedef struct
+struct tls_ctx
 {
     br_ssl_client_context client;
     br_x509_minimal_context x509;
     unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
-} tls_ctx;
-
-typedef struct conn conn_t;
+};
 
 struct conn
 {
     int fd;
-    tls_ctx tls;
+    struct tls_ctx tls;
 
-    ssize_t (*read)(conn_t *conn, void *buf, size_t len,
+    ssize_t (*read)(struct conn *conn, void *buf, size_t len,
                     int64_t deadline);
-    ssize_t (*write)(conn_t *conn, const void *buf, size_t len,
+    ssize_t (*write)(struct conn *conn, const void *buf, size_t len,
                      int64_t deadline);
-    int (*close)(conn_t *conn);
+    int (*close)(struct conn *conn);
 };
 
-typedef struct
+struct http_headers
 {
     ssize_t content_length;
     int chunked;
     int has_location;
     char location[URL_LENGTH];
-} http_headers_t;
+};
 
 const char *http_error_name(http_error_t err)
 {
@@ -218,7 +216,7 @@ wait_for_socket(int fd, short events, int64_t deadline)
 }
 
 static int
-run_brssl_engine(conn_t *conn, unsigned int target, int64_t deadline)
+run_brssl_engine(struct conn *conn, unsigned int target, int64_t deadline)
 {
     br_ssl_engine_context *engine;
 
@@ -345,7 +343,7 @@ run_brssl_engine(conn_t *conn, unsigned int target, int64_t deadline)
     }
 }
 
-ssize_t tcp_read(conn_t *conn, void *buf, size_t len, int64_t deadline)
+ssize_t tcp_read(struct conn *conn, void *buf, size_t len, int64_t deadline)
 {
     for (;;)
     {
@@ -369,7 +367,7 @@ ssize_t tcp_read(conn_t *conn, void *buf, size_t len, int64_t deadline)
             return -1;
     }
 }
-ssize_t tcp_write(conn_t *conn, const void *buf, size_t len,
+ssize_t tcp_write(struct conn *conn, const void *buf, size_t len,
                   int64_t deadline)
 {
     for (;;)
@@ -394,12 +392,12 @@ ssize_t tcp_write(conn_t *conn, const void *buf, size_t len,
             return -1;
     }
 }
-int tcp_close(conn_t *conn)
+int tcp_close(struct conn *conn)
 {
     return close(conn->fd);
 }
 
-ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int64_t deadline)
+ssize_t tls_read(struct conn *conn, void *dst_buf, size_t len, int64_t deadline)
 {
     unsigned char *buf;
     size_t alen;
@@ -432,7 +430,7 @@ ssize_t tls_read(conn_t *conn, void *dst_buf, size_t len, int64_t deadline)
     return alen;
 }
 
-ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
+ssize_t tls_write(struct conn *conn, const void *src_buf, size_t len,
                   int64_t deadline)
 {
     unsigned char *buf;
@@ -460,55 +458,54 @@ ssize_t tls_write(conn_t *conn, const void *src_buf, size_t len,
     br_ssl_engine_flush(&conn->tls.client.eng, 0);
     return alen;
 }
-int tls_close(conn_t *conn)
+int tls_close(struct conn *conn)
 {
     return close(conn->fd);
 }
 
-int parse_url(char *url, url_t *result)
+int parse_url(char *url, struct url *result)
 {
     if (url == NULL || result == NULL || url[0] == '\0')
         return -1;
 
-    char *f1;
-    char *f2;
+    char *scheme_end;
+    char *host_start;
+    char *path_start;
+    const char *scheme_delim = "://";
+
     strcpy(result->protocol, "https");
     strcpy(result->hostname, "");
     strcpy(result->port, "");
     strcpy(result->path, "/");
 
-    char *sep1 = "://";
-    char sep2 = '/';
-
-    f1 = strstr(url, sep1);
-    if (f1)
+    host_start = url;
+    scheme_end = strstr(url, scheme_delim);
+    if (scheme_end)
     {
-        size_t proto_len = f1 - url;
+        size_t proto_len = scheme_end - url;
         if (proto_len == 0 || proto_len >= PROTO_LENGTH)
             return -1;
-        strncpy(result->protocol, url, proto_len);
+        memcpy(result->protocol, url, proto_len);
         result->protocol[proto_len] = '\0';
-        f1 += strlen(sep1);
+        host_start = scheme_end + strlen(scheme_delim);
     }
 
-    char *host_start = f1 ? f1 : url;
-
-    f2 = strchr(host_start, sep2);
-    if (f2)
+    path_start = strchr(host_start, '/');
+    if (path_start)
     {
-        if (strlen(f2) >= PATH_LENGTH)
+        if (strlen(path_start) >= PATH_LENGTH)
             return -1;
-        strcpy(result->path, f2);
+        strcpy(result->path, path_start);
     }
 
-    char *host_end = f2 ? f2 : host_start + strlen(host_start);
+    char *host_end = path_start ? path_start : host_start + strlen(host_start);
     char *port_start = memchr(host_start, ':', host_end - host_start);
     char *hostname_end = port_start ? port_start : host_end;
     size_t host_len = hostname_end - host_start;
     if (host_len == 0 || host_len >= HOST_LENGTH)
         return -1;
 
-    strncpy(result->hostname, host_start, host_len);
+    memcpy(result->hostname, host_start, host_len);
     result->hostname[host_len] = '\0';
 
     if (port_start != NULL)
@@ -520,14 +517,14 @@ int parse_url(char *url, url_t *result)
         for (size_t i = 0; i < port_len; i++)
             if (!isdigit((unsigned char)port_start[i]))
                 return -1;
-        strncpy(result->port, port_start, port_len);
+        memcpy(result->port, port_start, port_len);
         result->port[port_len] = '\0';
     }
     return 0;
 }
 
 ssize_t
-read_exact(conn_t *conn, void *buf, size_t n)
+read_exact(struct conn *conn, void *buf, size_t n)
 {
     char *p = buf;
     int64_t deadline;
@@ -554,7 +551,7 @@ read_exact(conn_t *conn, void *buf, size_t n)
     return (ssize_t)off;
 }
 
-int fwrite_exact(int fd, const void *buf, size_t n)
+int write_fd_exact(int fd, const void *buf, size_t n)
 {
     const char *p = buf;
     size_t off = 0;
@@ -581,7 +578,7 @@ int fwrite_exact(int fd, const void *buf, size_t n)
     return 0;
 }
 
-int write_exact(conn_t *conn, const void *buf, size_t n)
+int write_exact(struct conn *conn, const void *buf, size_t n)
 {
     const char *p = buf;
     int64_t deadline;
@@ -615,7 +612,7 @@ int write_exact(conn_t *conn, const void *buf, size_t n)
     return 0;
 }
 
-int read_line(buf *buf, conn_t *conn)
+int read_line(struct conn *conn, struct line_buffer *line)
 {
     char c;
     int64_t deadline;
@@ -623,18 +620,18 @@ int read_line(buf *buf, conn_t *conn)
     char *tmp;
     size_t tmpsize;
 
-    if (buf->buffer == NULL)
+    if (line->buffer == NULL)
     {
-        if ((buf->buffer = malloc(512)) == NULL)
+        if ((line->buffer = malloc(512)) == NULL)
         {
             errno = ENOMEM;
             return (-1);
         }
-        buf->capacity = 512;
+        line->capacity = 512;
     }
 
-    buf->buffer[0] = '\0';
-    buf->size = 0;
+    line->buffer[0] = '\0';
+    line->size = 0;
     deadline = deadline_after(IO_TIMEOUT_MS);
     if (deadline < 0)
         return (-1);
@@ -650,24 +647,24 @@ int read_line(buf *buf, conn_t *conn)
             return (-1);
         }
 
-        buf->buffer[buf->size++] = c;
+        line->buffer[line->size++] = c;
 
-        if (buf->size == buf->capacity)
+        if (line->size == line->capacity)
         {
-            tmp = buf->buffer;
-            tmpsize = buf->capacity * 2 + 1;
+            tmp = line->buffer;
+            tmpsize = line->capacity * 2 + 1;
             if ((tmp = realloc(tmp, tmpsize)) == NULL)
             {
                 errno = ENOMEM;
                 return (-1);
             }
-            buf->buffer = tmp;
-            buf->capacity = tmpsize;
+            line->buffer = tmp;
+            line->capacity = tmpsize;
         }
 
     } while (c != '\n');
 
-    buf->buffer[buf->size] = '\0';
+    line->buffer[line->size] = '\0';
 
     return (0);
 }
@@ -720,7 +717,7 @@ int parse_status_line(char *line, int *status)
     return 0;
 }
 
-int connect_url(url_t p_url, conn_t *conn)
+int connect_url(struct conn *conn, const struct url *url)
 {
     const char *service;
     struct addrinfo *dns_res, *dns_res0 = NULL;
@@ -733,10 +730,10 @@ int connect_url(url_t p_url, conn_t *conn)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    service = p_url.port[0] != '\0' ? p_url.port : p_url.protocol;
+    service = url->port[0] != '\0' ? url->port : url->protocol;
 
     int e;
-    if ((e = getaddrinfo(p_url.hostname, service, &hints, &dns_res0)) != 0)
+    if ((e = getaddrinfo(url->hostname, service, &hints, &dns_res0)) != 0)
     {
         return http_fail(HTTP_ERR_CONNECT, gai_strerror(e));
     }
@@ -782,7 +779,7 @@ int connect_url(url_t p_url, conn_t *conn)
         return http_fail(HTTP_ERR_CONNECT, "setting nonblocking mode");
     }
 
-    if (strcasecmp(p_url.protocol, "https") == 0)
+    if (strcasecmp(url->protocol, "https") == 0)
     {
         br_ssl_client_init_full(
             &conn->tls.client,
@@ -792,7 +789,7 @@ int connect_url(url_t p_url, conn_t *conn)
         br_ssl_engine_set_buffer(&conn->tls.client.eng, &conn->tls.iobuf, sizeof conn->tls.iobuf, 1);
 
         if (!br_ssl_client_reset(&conn->tls.client,
-                                 p_url.hostname, 0))
+                                 url->hostname, 0))
         {
             return http_fail(HTTP_ERR_CONNECT, "initializing TLS");
         }
@@ -811,13 +808,13 @@ int connect_url(url_t p_url, conn_t *conn)
     return HTTP_OK;
 }
 
-int read_status(conn_t *conn, int *status, buf *line)
+int read_status(struct conn *conn, int *status, struct line_buffer *line)
 {
     int info_responses = 0;
 
     while (1)
     {
-        if (read_line(line, conn) == -1)
+        if (read_line(conn, line) == -1)
         {
             return http_fail(HTTP_ERR_IO, "reading status line");
         }
@@ -840,7 +837,7 @@ int read_status(conn_t *conn, int *status, buf *line)
             // discard headers
             while (1)
             {
-                if (read_line(line, conn) == -1)
+                if (read_line(conn, line) == -1)
                     return http_fail(HTTP_ERR_IO, "reading interim response header");
 
                 if (strcmp(line->buffer, "\r\n") == 0 ||
@@ -854,7 +851,8 @@ int read_status(conn_t *conn, int *status, buf *line)
     }
 }
 
-int read_headers(conn_t *conn, buf *line, http_headers_t *headers)
+int read_headers(struct conn *conn, struct http_headers *headers,
+                 struct line_buffer *line)
 {
 
     headers->content_length = -1;
@@ -863,12 +861,12 @@ int read_headers(conn_t *conn, buf *line, http_headers_t *headers)
     headers->location[0] = '\0';
 
     char *col = NULL;
-    char *h_key = NULL;
-    char *h_val = NULL;
+    char *header_name = NULL;
+    char *header_value = NULL;
 
     while (1)
     {
-        if (read_line(line, conn) == -1)
+        if (read_line(conn, line) == -1)
         {
             return http_fail(HTTP_ERR_IO, "reading header");
         }
@@ -885,59 +883,60 @@ int read_headers(conn_t *conn, buf *line, http_headers_t *headers)
 
         *col = '\0';
 
-        h_key = line->buffer;
-        h_val = col + 1;
+        header_name = line->buffer;
+        header_value = col + 1;
 
-        while (*h_val == ' ' || *h_val == '\t')
-            h_val++;
+        while (*header_value == ' ' || *header_value == '\t')
+            header_value++;
 
-        h_val[strcspn(h_val, "\r\n")] = '\0';
+        header_value[strcspn(header_value, "\r\n")] = '\0';
 
-        // printf("key:%s value:%s\n", h_key, h_val);
+        // printf("key:%s value:%s\n", header_name, header_value);
 
-        if (strcasecmp(h_key, "Content-Encoding") == 0 &&
-            strcasecmp(h_val, "identity") != 0)
+        if (strcasecmp(header_name, "Content-Encoding") == 0 &&
+            strcasecmp(header_value, "identity") != 0)
         {
             return http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "unsupported Content-Encoding");
         }
 
-        if (strcasecmp(h_key, "Content-Length") == 0)
+        if (strcasecmp(header_name, "Content-Length") == 0)
         {
             char *end;
             long val;
             errno = 0;
-            val = strtol(h_val, &end, 10);
-            if (end == h_val || *end != '\0' || errno == ERANGE || val < 0 || (headers->content_length >= 0 && val != headers->content_length))
+            val = strtol(header_value, &end, 10);
+            if (end == header_value || *end != '\0' || errno == ERANGE || val < 0 || (headers->content_length >= 0 && val != headers->content_length))
             {
-                return http_fail(HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH, h_val);
+                return http_fail(HTTP_ERR_HEADER_INVALID_CONTENT_LENGTH,
+                                 header_value);
             }
             headers->content_length = val;
         }
-        if (strcasecmp(h_key, "Transfer-Encoding") == 0)
+        if (strcasecmp(header_name, "Transfer-Encoding") == 0)
         {
-            if (strcasecmp(h_val, "Chunked") == 0)
+            if (strcasecmp(header_value, "Chunked") == 0)
             {
                 headers->chunked = 1;
                 continue;
             }
             return http_fail(HTTP_ERR_HEADER_UNSUPPORTED_TRANSFER_ENCODING,
-                             h_val);
+                             header_value);
         }
-        if (strcasecmp(h_key, "Location") == 0)
+        if (strcasecmp(header_name, "Location") == 0)
         {
             headers->has_location = 1;
-            if (strlen(h_val) + 1 > URL_LENGTH)
+            if (strlen(header_value) + 1 > URL_LENGTH)
             {
                 return http_fail(HTTP_ERR_RESPONSE_UNSUPPORTED, "unsupported location size");
             }
-            strcpy(headers->location, h_val);
+            strcpy(headers->location, header_value);
         }
     };
     return HTTP_OK;
 }
 
-int read_body(conn_t *conn, int dfile, buf *line,
-              const http_headers_t *headers, const http_req_t *req)
+int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
+              const http_req_t *req, struct line_buffer *line)
 {
     ssize_t rn = 0;
     char res_buf[2048];
@@ -947,7 +946,7 @@ int read_body(conn_t *conn, int dfile, buf *line,
         size_t down_n = 0;
         while (1)
         {
-            if (read_line(line, conn) == -1)
+            if (read_line(conn, line) == -1)
             {
                 return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
             };
@@ -981,7 +980,7 @@ int read_body(conn_t *conn, int dfile, buf *line,
 
             if (chunk_size == 0)
             {
-                if (read_line(line, conn) == -1)
+                if (read_line(conn, line) == -1)
                     return http_fail(HTTP_ERR_BODY_TRUNCATED, NULL);
                 break;
             }
@@ -1000,7 +999,7 @@ int read_body(conn_t *conn, int dfile, buf *line,
                     return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
 
-                if (fwrite_exact(dfile, res_buf, rn) == -1)
+                if (write_fd_exact(dfile, res_buf, rn) == -1)
                     return http_fail(HTTP_ERR_IO, "writing file");
 
                 down_n += rn;
@@ -1034,7 +1033,7 @@ int read_body(conn_t *conn, int dfile, buf *line,
                 return http_fail(HTTP_ERR_IO, "reading body");
             }
 
-            if (fwrite_exact(dfile, res_buf, rn) == -1)
+            if (write_fd_exact(dfile, res_buf, rn) == -1)
                 return http_fail(HTTP_ERR_IO, "writing file");
             total -= rn;
             if (req->on_progress)
@@ -1054,7 +1053,7 @@ int read_body(conn_t *conn, int dfile, buf *line,
             if (rn <= 0)
                 break;
 
-            if (fwrite_exact(dfile, res_buf, rn) == -1)
+            if (write_fd_exact(dfile, res_buf, rn) == -1)
                 return http_fail(HTTP_ERR_IO, "writing file");
             down_n += rn;
             if (req->on_progress)
@@ -1070,22 +1069,22 @@ int read_body(conn_t *conn, int dfile, buf *line,
 int http_get(http_req_t req)
 {
 
-    conn_t conn = (conn_t){0};
+    struct conn conn = (struct conn){0};
     int result;
     int no_body;
 
     char req_buf[6114];
-    buf line = {.buffer = NULL, .capacity = 0, .size = 0};
+    struct line_buffer line = {.buffer = NULL, .capacity = 0, .size = 0};
 
     int dfile = -1;
-    http_headers_t headers;
+    struct http_headers headers;
 
     char c_url[URL_LENGTH];
     int url_n = snprintf(c_url, sizeof(c_url), "%s", req.url);
     if (url_n < 0 || (size_t)url_n >= sizeof(c_url))
         return http_fail(HTTP_ERR_URL_INVALID, req.url);
 
-    url_t p_url;
+    struct url p_url;
 
     int redirects = 0;
     int redirect = 0;
@@ -1100,7 +1099,7 @@ int http_get(http_req_t req)
         no_body = 0;
         int status;
         result = HTTP_OK;
-        p_url = (url_t){0};
+        p_url = (struct url){0};
         char authority[HOST_LENGTH + 7];
 
         if (parse_url(c_url, &p_url) == -1)
@@ -1109,7 +1108,7 @@ int http_get(http_req_t req)
             goto cleanup;
         }
 
-        result = connect_url(p_url, &conn);
+        result = connect_url(&conn, &p_url);
         if (result != HTTP_OK)
             goto cleanup;
 
@@ -1203,7 +1202,7 @@ int http_get(http_req_t req)
 
         // read headers
 
-        result = read_headers(&conn, &line, &headers);
+        result = read_headers(&conn, &headers, &line);
         if (result != HTTP_OK)
             goto cleanup;
 
@@ -1257,7 +1256,7 @@ int http_get(http_req_t req)
         goto cleanup;
     }
 
-    result = read_body(&conn, dfile, &line, &headers, &req);
+    result = read_body(&conn, dfile, &headers, &req, &line);
     if (result != HTTP_OK)
         goto cleanup;
 

@@ -25,9 +25,9 @@
 - Proper Error handling - Deterministic failure handling - Proper Cleanup
 
 - Refactoring
-    - naming
-    - fn param pos
-- remove strncpy
+    - ~~naming~~
+    - ~~fn param pos~~
+- ~~remove strncpy~~
 
 - make CA bundle configurable?
 - maybe add a max size bound for line buffer?

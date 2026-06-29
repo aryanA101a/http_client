@@ -28,7 +28,7 @@ main(int argc, char **argv)
     req = (http_req_t){.url = argv[1],
                        .on_progress = on_progress,
                        .sink = NULL};
-    ret=http_get(req);
+    ret = http_get(req);
     printf("\n");
     return ret;
 }
