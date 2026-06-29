@@ -463,6 +463,22 @@ int tls_close(struct conn *conn)
     return close(conn->fd);
 }
 
+void conn_close(struct conn *conn)
+{
+    if (conn->fd >= 0)
+    {
+        if (conn->close)
+            conn->close(conn);
+        else
+            close(conn->fd);
+    }
+
+    conn->fd = -1;
+    conn->read = NULL;
+    conn->write = NULL;
+    conn->close = NULL;
+}
+
 int parse_url(char *url, struct url *result)
 {
     if (url == NULL || result == NULL || url[0] == '\0')
@@ -489,6 +505,9 @@ int parse_url(char *url, struct url *result)
         result->protocol[proto_len] = '\0';
         host_start = scheme_end + strlen(scheme_delim);
     }
+    if (strcasecmp(result->protocol, "http") != 0 &&
+        strcasecmp(result->protocol, "https") != 0)
+        return -1;
 
     path_start = strchr(host_start, '/');
     if (path_start)
@@ -722,6 +741,9 @@ int connect_url(struct conn *conn, const struct url *url)
     const char *service;
     struct addrinfo *dns_res, *dns_res0 = NULL;
     conn->fd = -1;
+    conn->read = NULL;
+    conn->write = NULL;
+    conn->close = NULL;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -758,8 +780,7 @@ int connect_url(struct conn *conn, const struct url *url)
         }
         if (e < 0)
         {
-            close(conn->fd);
-            conn->fd = -1;
+            conn_close(conn);
             continue;
         }
 
@@ -774,8 +795,7 @@ int connect_url(struct conn *conn, const struct url *url)
     int flags = fcntl(conn->fd, F_GETFL, 0);
     if (flags < 0 || fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK) < 0)
     {
-        close(conn->fd);
-        conn->fd = -1;
+        conn_close(conn);
         return http_fail(HTTP_ERR_CONNECT, "setting nonblocking mode");
     }
 
@@ -791,6 +811,7 @@ int connect_url(struct conn *conn, const struct url *url)
         if (!br_ssl_client_reset(&conn->tls.client,
                                  url->hostname, 0))
         {
+            conn_close(conn);
             return http_fail(HTTP_ERR_CONNECT, "initializing TLS");
         }
 
@@ -1069,7 +1090,7 @@ int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
 int http_get(http_req_t req)
 {
 
-    struct conn conn = (struct conn){0};
+    struct conn conn = {.fd = -1};
     int result;
     int no_body;
 
@@ -1094,7 +1115,6 @@ int http_get(http_req_t req)
 
         redirect = 0;
 
-        conn.fd = -1;
         ssize_t n = 0;
         no_body = 0;
         int status;
@@ -1233,7 +1253,7 @@ int http_get(http_req_t req)
                 goto cleanup;
             }
 
-            conn.close(&conn);
+            conn_close(&conn);
         }
     } while (redirect && ++redirects <= MAX_REDIRECTS);
 
@@ -1263,8 +1283,7 @@ int http_get(http_req_t req)
 cleanup:
     if (line.buffer)
         free(line.buffer);
-    if (conn.close)
-        conn.close(&conn);
+    conn_close(&conn);
     if (dfile >= 0)
         close(dfile);
 

@@ -27,6 +27,7 @@
 - Refactoring
     - ~~naming~~
     - ~~fn param pos~~
+    - ~~is dispose clean?~~
 - ~~remove strncpy~~
 
 - make CA bundle configurable?
