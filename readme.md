@@ -16,6 +16,8 @@ git submodule update --init
 
 ## Build
 
+Note: Can be build on MacOS and FreeBSD after setting `FREEBSD_SRC` in the Makefile.
+
 ```sh
 bmake
 ```

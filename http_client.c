@@ -6,6 +6,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -570,33 +571,6 @@ read_exact(struct conn *conn, void *buf, size_t n)
     return (ssize_t)off;
 }
 
-int write_fd_exact(int fd, const void *buf, size_t n)
-{
-    const char *p = buf;
-    size_t off = 0;
-    size_t len = (size_t)n;
-    do
-    {
-        ssize_t wn = write(fd, p + off, len - off);
-
-        if (wn < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (wn == 0)
-        {
-            errno = EIO;
-            return -1;
-        }
-
-        off += wn;
-
-    } while (off < len);
-    return 0;
-}
-
 int write_exact(struct conn *conn, const void *buf, size_t n)
 {
     const char *p = buf;
@@ -734,6 +708,17 @@ int parse_status_line(char *line, int *status)
     *status = st;
 
     return 0;
+}
+
+const char *output_name_from_path(const char *path)
+{
+    const char *slash;
+
+    slash = strrchr(path, '/');
+    if (slash == NULL || slash[1] == '\0')
+        return "unknown";
+
+    return slash + 1;
 }
 
 int connect_url(struct conn *conn, const struct url *url)
@@ -956,7 +941,7 @@ int read_headers(struct conn *conn, struct http_headers *headers,
     return HTTP_OK;
 }
 
-int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
+int read_body(struct conn *conn, sink_t *sink, const struct http_headers *headers,
               const http_req_t *req, struct line_buffer *line)
 {
     ssize_t rn = 0;
@@ -1020,8 +1005,8 @@ int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
                     return http_fail(HTTP_ERR_IO, "reading chunk body");
                 }
 
-                if (write_fd_exact(dfile, res_buf, rn) == -1)
-                    return http_fail(HTTP_ERR_IO, "writing file");
+                if (sink->write(sink, res_buf, rn) == -1)
+                    return http_fail(HTTP_ERR_IO, "writing output");
 
                 down_n += rn;
                 total -= rn;
@@ -1054,8 +1039,8 @@ int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
                 return http_fail(HTTP_ERR_IO, "reading body");
             }
 
-            if (write_fd_exact(dfile, res_buf, rn) == -1)
-                return http_fail(HTTP_ERR_IO, "writing file");
+            if (sink->write(sink, res_buf, rn) == -1)
+                return http_fail(HTTP_ERR_IO, "writing output");
             total -= rn;
             if (req->on_progress)
                 req->on_progress(headers->content_length - total, headers->content_length);
@@ -1074,8 +1059,8 @@ int read_body(struct conn *conn, int dfile, const struct http_headers *headers,
             if (rn <= 0)
                 break;
 
-            if (write_fd_exact(dfile, res_buf, rn) == -1)
-                return http_fail(HTTP_ERR_IO, "writing file");
+            if (sink->write(sink, res_buf, rn) == -1)
+                return http_fail(HTTP_ERR_IO, "writing output");
             down_n += rn;
             if (req->on_progress)
                 req->on_progress(down_n, 0);
@@ -1097,8 +1082,12 @@ int http_get(http_req_t req)
     char req_buf[6114];
     struct line_buffer line = {.buffer = NULL, .capacity = 0, .size = 0};
 
-    int dfile = -1;
+    sink_t *sink = req.sink;
+    int sink_open = 0;
     struct http_headers headers;
+
+    if (sink == NULL)
+        return http_fail(HTTP_ERR_USAGE, "sink required");
 
     char c_url[URL_LENGTH];
     int url_n = snprintf(c_url, sizeof(c_url), "%s", req.url);
@@ -1268,24 +1257,21 @@ int http_get(http_req_t req)
         goto cleanup;
     }
 
-    char *filename = !strcmp(p_url.path, "/") ? "unknown" : strrchr(p_url.path, '/') + 1;
-    dfile = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (dfile == -1)
-    {
-        result = http_fail(HTTP_ERR_IO, filename);
+    result = sink->open(sink, output_name_from_path(p_url.path));
+    if (result != HTTP_OK)
         goto cleanup;
-    }
+    sink_open = 1;
 
-    result = read_body(&conn, dfile, &headers, &req, &line);
+    result = read_body(&conn, sink, &headers, &req, &line);
     if (result != HTTP_OK)
         goto cleanup;
 
 cleanup:
+    if (sink_open)
+        sink->close(sink);
     if (line.buffer)
         free(line.buffer);
     conn_close(&conn);
-    if (dfile >= 0)
-        close(dfile);
 
     return result;
 }

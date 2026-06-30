@@ -21,7 +21,7 @@
     - fragmented TLS records drive `run_brssl_engine()` to application data
     - distinguish TLS `close_notify` from an abrupt socket close
 
-- Sink Handling
+- ~~Sink Handling~~
 - Proper Error handling - Deterministic failure handling - Proper Cleanup
 
 - Refactoring

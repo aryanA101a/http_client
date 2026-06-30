@@ -8,7 +8,7 @@ BEARSSL_DIR=	${.CURDIR}/BearSSL
 BEARSSL_LIB=	${BEARSSL_DIR}/build/libbearssl.a
 BEARSSL_TA=	${BEARSSL_DIR}/build/brssl
 
-FREEBSD_SRC?=	${.CURDIR}/../freebsd/vendor-exp/freebsd-src
+FREEBSD_SRC?=	${.CURDIR}/../freebsd/src/freebsd-src/
 CAROOT_DIR=	${FREEBSD_SRC}/secure/caroot/trusted
 
 .if !exists(${CAROOT_DIR})
@@ -17,14 +17,15 @@ CAROOT_DIR=	${FREEBSD_SRC}/secure/caroot/trusted
 
 TRUST_ANCHORS_INC=	trust_anchors.inc
 
-SRCS=	http_client.c main.c
+SRCS=	http_client.c http_file_sink.c main.c
+DPSRCS+=	${TRUST_ANCHORS_INC}
 
 CFLAGS+=	-I${BEARSSL_DIR}/inc -I${.OBJDIR}
 DPADD+=		${BEARSSL_LIB}
 LDADD+=		${BEARSSL_LIB}
 CLEANFILES+=	${TRUST_ANCHORS_INC}
 
-http_client.o: ${TRUST_ANCHORS_INC}
+http_client.o http_client.pieo http_client.po http_client.pico: ${TRUST_ANCHORS_INC}
 
 ${TRUST_ANCHORS_INC}: ${BEARSSL_TA}
 	${BEARSSL_TA} ta -q ${CAROOT_DIR}/*.pem > ${.TARGET}

@@ -3,15 +3,17 @@
 
 #include <stddef.h>
 
-typedef struct sink
+typedef struct http_sink
 {
-    int (*write)(struct sink *s, const void *data, size_t len);
+    int (*open)(struct http_sink *s, const char *name);
+    int (*write)(struct http_sink *s, const void *data, size_t len);
+    void (*close)(struct http_sink *s);
 } sink_t;
 
 typedef struct
 {
-    sink_t *sink;
     const char *url;
+    sink_t *sink;
     void (*on_progress)(size_t received, size_t total);
 } http_req_t;
 
